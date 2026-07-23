@@ -1,0 +1,6 @@
+services:
+  lab-command-injection-express:
+    build: .
+    ports:
+      - "5102:5000"
+    restart: unless-stopped

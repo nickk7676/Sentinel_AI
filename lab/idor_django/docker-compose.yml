@@ -1,0 +1,6 @@
+services:
+  lab-idor-django:
+    build: .
+    ports:
+      - "5203:5000"
+    restart: unless-stopped

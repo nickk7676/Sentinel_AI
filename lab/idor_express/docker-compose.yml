@@ -1,0 +1,6 @@
+services:
+  lab-idor-express:
+    build: .
+    ports:
+      - "5103:5000"
+    restart: unless-stopped

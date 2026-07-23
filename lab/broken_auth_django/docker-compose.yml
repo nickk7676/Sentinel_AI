@@ -1,0 +1,6 @@
+services:
+  lab-broken-auth-django:
+    build: .
+    ports:
+      - "5205:5000"
+    restart: unless-stopped

@@ -1,0 +1,6 @@
+services:
+  lab-idor-distractor:
+    build: .
+    ports:
+      - "5303:5000"
+    restart: unless-stopped

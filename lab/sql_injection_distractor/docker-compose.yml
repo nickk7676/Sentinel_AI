@@ -1,0 +1,6 @@
+services:
+  lab-sql-injection-distractor:
+    build: .
+    ports:
+      - "5301:5000"
+    restart: unless-stopped

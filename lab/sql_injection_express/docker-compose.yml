@@ -1,0 +1,6 @@
+services:
+  lab-sql-injection-express:
+    build: .
+    ports:
+      - "5101:5000"
+    restart: unless-stopped

@@ -1,0 +1,14 @@
+{
+  "name": "sentinelai-lab-sql-injection-express",
+  "version": "1.0.0",
+  "private": true,
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "express-session": "^1.18.0",
+    "better-sqlite3": "^11.3.0"
+  }
+}

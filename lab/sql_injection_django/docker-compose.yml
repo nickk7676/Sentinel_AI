@@ -1,0 +1,6 @@
+services:
+  lab-sql-injection-django:
+    build: .
+    ports:
+      - "5201:5000"
+    restart: unless-stopped

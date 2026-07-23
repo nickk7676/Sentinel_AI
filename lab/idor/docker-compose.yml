@@ -1,0 +1,6 @@
+services:
+  lab-idor:
+    build: .
+    ports:
+      - "5003:5000"
+    restart: unless-stopped

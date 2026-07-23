@@ -1,0 +1,6 @@
+services:
+  lab-broken-auth-express:
+    build: .
+    ports:
+      - "5105:5000"
+    restart: unless-stopped

@@ -1,0 +1,6 @@
+services:
+  lab-command-injection-distractor:
+    build: .
+    ports:
+      - "5302:5000"
+    restart: unless-stopped

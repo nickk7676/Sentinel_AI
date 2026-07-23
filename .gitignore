@@ -1,0 +1,47 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# --- Virtual environments (all three found in this repo) ---
+venv/
+venv311/
+.venv/
+env/
+ENV/
+
+# --- Trained model weights / adapters (regenerable via training, not source) ---
+# 615MB+ of LoRA checkpoints - training/battle_loop.py and train_agent.py
+# regenerate these; nothing here is hand-authored.
+training/adapters/
+
+# --- Node (lab/*_express Docker targets install inside the image, not on
+# the host - but keep this in case anything is ever run locally too) ---
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# --- Secrets ---
+.env
+.env.*
+*.pem
+*.key
+.streamlit/secrets.toml
+
+# --- Claude Code local (personal, not shared) settings ---
+.claude/settings.local.json
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
+desktop.ini

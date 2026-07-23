@@ -1,0 +1,6 @@
+services:
+  lab-command-injection-django:
+    build: .
+    ports:
+      - "5202:5000"
+    restart: unless-stopped

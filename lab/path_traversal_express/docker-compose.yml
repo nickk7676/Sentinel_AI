@@ -1,0 +1,6 @@
+services:
+  lab-path-traversal-express:
+    build: .
+    ports:
+      - "5104:5000"
+    restart: unless-stopped

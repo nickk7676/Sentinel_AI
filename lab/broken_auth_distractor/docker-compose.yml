@@ -1,0 +1,6 @@
+services:
+  lab-broken-auth-distractor:
+    build: .
+    ports:
+      - "5305:5000"
+    restart: unless-stopped

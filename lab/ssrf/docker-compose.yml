@@ -1,0 +1,6 @@
+services:
+  lab-ssrf:
+    build: .
+    ports:
+      - "5006:5000"
+    restart: unless-stopped

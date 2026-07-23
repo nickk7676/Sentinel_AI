@@ -1,0 +1,6 @@
+services:
+  lab-ssrf-express:
+    build: .
+    ports:
+      - "5106:5000"
+    restart: unless-stopped

@@ -1,0 +1,13 @@
+# Self-training dependencies
+# Install PyTorch with CUDA FIRST (before this file):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Then install this file:
+#   pip install -r requirements-training.txt
+
+transformers>=4.40.0
+peft>=0.10.0
+trl>=0.8.6
+bitsandbytes>=0.43.0
+datasets>=2.18.0
+accelerate>=0.28.0
+tensorboard>=2.16.0

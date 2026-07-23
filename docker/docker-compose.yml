@@ -1,0 +1,115 @@
+# Step 5 - brings up every lab target across every technique in one shot,
+# instead of 24 manual `docker compose up` calls (one per lab/<dir>).
+# Per-target lab/<dir>/docker-compose.yml files still work standalone for
+# focused debugging of a single target.
+#
+# Usage: docker compose -f docker/docker-compose.yml up -d --build
+
+services:
+  # --- sql_injection ---
+  lab-target:
+    build: ../lab/target
+    ports: ["5001:5000"]
+    restart: unless-stopped
+  lab-sql-injection-express:
+    build: ../lab/sql_injection_express
+    ports: ["5101:5000"]
+    restart: unless-stopped
+  lab-sql-injection-django:
+    build: ../lab/sql_injection_django
+    ports: ["5201:5000"]
+    restart: unless-stopped
+  lab-sql-injection-distractor:
+    build: ../lab/sql_injection_distractor
+    ports: ["5301:5000"]
+    restart: unless-stopped
+
+  # --- command_injection ---
+  lab-command-injection:
+    build: ../lab/command_injection
+    ports: ["5002:5000"]
+    restart: unless-stopped
+  lab-command-injection-express:
+    build: ../lab/command_injection_express
+    ports: ["5102:5000"]
+    restart: unless-stopped
+  lab-command-injection-django:
+    build: ../lab/command_injection_django
+    ports: ["5202:5000"]
+    restart: unless-stopped
+  lab-command-injection-distractor:
+    build: ../lab/command_injection_distractor
+    ports: ["5302:5000"]
+    restart: unless-stopped
+
+  # --- idor ---
+  lab-idor:
+    build: ../lab/idor
+    ports: ["5003:5000"]
+    restart: unless-stopped
+  lab-idor-express:
+    build: ../lab/idor_express
+    ports: ["5103:5000"]
+    restart: unless-stopped
+  lab-idor-django:
+    build: ../lab/idor_django
+    ports: ["5203:5000"]
+    restart: unless-stopped
+  lab-idor-distractor:
+    build: ../lab/idor_distractor
+    ports: ["5303:5000"]
+    restart: unless-stopped
+
+  # --- path_traversal ---
+  lab-path-traversal:
+    build: ../lab/path_traversal
+    ports: ["5004:5000"]
+    restart: unless-stopped
+  lab-path-traversal-express:
+    build: ../lab/path_traversal_express
+    ports: ["5104:5000"]
+    restart: unless-stopped
+  lab-path-traversal-django:
+    build: ../lab/path_traversal_django
+    ports: ["5204:5000"]
+    restart: unless-stopped
+  lab-path-traversal-distractor:
+    build: ../lab/path_traversal_distractor
+    ports: ["5304:5000"]
+    restart: unless-stopped
+
+  # --- broken_auth ---
+  lab-broken-auth:
+    build: ../lab/broken_auth
+    ports: ["5005:5000"]
+    restart: unless-stopped
+  lab-broken-auth-express:
+    build: ../lab/broken_auth_express
+    ports: ["5105:5000"]
+    restart: unless-stopped
+  lab-broken-auth-django:
+    build: ../lab/broken_auth_django
+    ports: ["5205:5000"]
+    restart: unless-stopped
+  lab-broken-auth-distractor:
+    build: ../lab/broken_auth_distractor
+    ports: ["5305:5000"]
+    restart: unless-stopped
+
+  # --- ssrf ---
+  lab-ssrf:
+    build: ../lab/ssrf
+    ports: ["5006:5000"]
+    restart: unless-stopped
+  lab-ssrf-express:
+    build: ../lab/ssrf_express
+    ports: ["5106:5000"]
+    restart: unless-stopped
+  lab-ssrf-django:
+    build: ../lab/ssrf_django
+    ports: ["5206:5000"]
+    restart: unless-stopped
+  lab-ssrf-distractor:
+    build: ../lab/ssrf_distractor
+    ports: ["5306:5000"]
+    restart: unless-stopped

@@ -1,0 +1,6 @@
+services:
+  lab-ssrf-django:
+    build: .
+    ports:
+      - "5206:5000"
+    restart: unless-stopped
