@@ -5,6 +5,13 @@ from pathlib import Path
 
 import requests
 
+from agents.safety.redact import redact_text
+
+# Providers whose API calls leave the machine - Step 6.3 requires redaction
+# before anything is sent to one of these. "local" (in-process) and
+# "ollama" (default http://localhost:11434) never leave the box.
+_REMOTE_PROVIDERS = {"openai", "huggingface"}
+
 # TEMPORARY bootstrap nudge (added 2026-07-17, diagnosing near-zero IDOR
 # detection): real battle logs showed blue calling "no threat" on every
 # single IDOR attempt, including ones that succeeded, even when the log line
@@ -15,14 +22,81 @@ import requests
 # reliably catches this on its own from training examples.
 _BOOTSTRAP_NUDGE = " A request can look completely successful and unremarkable - correct status, well-formed response - and still be an attack: check whether the identity making the request is actually consistent with the account, session, or resource it is accessing, not just whether the request succeeded. A mismatch between who is asking and who/what is being accessed is itself a signal, even with nothing else suspicious in the log."
 
+# TEMPORARY bootstrap nudge (added 2026-07-25, diagnosing generic
+# recommended_fix text): real battle logs showed blue reliably detecting
+# attacks but never producing a recommended_fix more specific than security-
+# advice boilerplate ("sanitize input", "implement proper access control",
+# "follow security best practices") - true across every category, not just
+# one - so it never named the actual mechanism that closes the hole and
+# never passed Step 7.2's fix verification (agents/judge/verification.py's
+# per-technique fix_keywords, deliberately tightened to reject exactly this
+# kind of generic answer - see agents/techniques/*.py). This is a general
+# procedural reminder (not naming any lab's specific fix) - remove once
+# blue reliably produces mechanism-specific fixes from training examples of
+# its own verified wins.
+_FIX_SPECIFICITY_NUDGE = (
+    " Your recommended_fix must name the exact technical mechanism that closes this specific hole, not a general security "
+    "principle - a reviewer should be able to tell which line of code or logic check is missing just from reading your answer. "
+    "Never answer with generic phrases like \"sanitize input\", \"validate input\", \"implement proper access control/"
+    "authentication\", or \"follow security best practices\" - those are true of almost every vulnerability and fix nothing on "
+    "their own. Instead state precisely what check, comparison, or code change is missing and where it belongs - for example: "
+    "which two values should have been compared but weren't, which dangerous operation should never have received unescaped "
+    "input, which value should have been generated unpredictably instead of predictably, or which destination should have been "
+    "rejected before a request was made to it. If you can't identify that specific mechanism from the evidence in front of you, "
+    "say what additional evidence you'd need - do not fall back to a generic platitude."
+)
+
+# TEMPORARY bootstrap nudge (added 2026-07-26, diagnosing recommended_fix
+# containing the attack payload itself): real battle logs showed blue's
+# recommended_fix was, in the large majority of fix-verification attempts
+# (78/105 for sql_injection so far), the literal attack payload verbatim
+# (e.g. "' OR '1'='1' --") rather than any description of a fix - and this
+# same pattern is baked into ~25% of blue's own saved sql_injection training
+# examples, so it's being actively reinforced round over round, not just a
+# prompting gap. Blue appears to be conflating "what the attacker sent" with
+# "what should change in the code". This is a general procedural reminder
+# (not naming any lab's specific fix) - remove once blue reliably stops
+# doing this from training examples of its own verified wins.
+_FIX_PAYLOAD_CONFUSION_NUDGE = (
+    " recommended_fix must NEVER contain the attacker's actual input, payload, or exploit string itself - copying what the "
+    "attacker sent is not a fix, it is just repeating the attack back. If the specific value the attacker sent is worth "
+    "mentioning, that belongs in explanation, not recommended_fix. recommended_fix must instead describe, in your own words "
+    "and phrased as an instruction to a developer, the code-level change that would stop this entire class of input from "
+    "working - never a quoted string, command, URL, or value copied from the attack itself."
+)
+
+# TEMPORARY bootstrap nudge (added 2026-07-26, same diagnosis as
+# _FIX_PAYLOAD_CONFUSION_NUDGE above): a worked example, not just an
+# abstract rule - this codebase has already learned once, the hard way, with
+# path_traversal.py's own bootstrap nudge, that this 3B base model follows a
+# single concrete shown example far more reliably than stacked prose rules.
+# Deliberately a fictional, made-up vulnerability class (not one of this
+# lab's real 6 techniques) so it teaches the general shape of a correct
+# answer without ever hinting at a real technique's actual fix or category
+# keywords. Remove once blue reliably gets this right from its own training
+# examples instead of needing it spelled out here.
+_FIX_WORKED_EXAMPLE = """
+
+Worked example (fictional, illustrative only - not one of the real categories you'll actually see):
+Log line: 'REQUEST path=/api/export?fmt=../../../etc/passwd result=SUCCESS'
+WRONG recommended_fix: "../../../etc/passwd" (this is just the attacker's payload copied back - not a fix, and worthless as an answer)
+RIGHT recommended_fix: "Reject any fmt value containing path separators or '..' segments before it is joined onto the export directory, and confirm the resolved path stays inside that directory."
+The WRONG answer restates evidence already visible in the log. The RIGHT answer is a code-level instruction that would still make sense even if you deleted the log line above it."""
+
+_VALID_SEVERITIES = ("low", "medium", "high", "critical")
+
 SYSTEM_PROMPT = """You are a cybersecurity blue team AI agent responsible for detecting and neutralizing attacks.
-Analyze the provided attack details and produce a structured defense assessment.""" + _BOOTSTRAP_NUDGE + """
+Analyze the provided attack details and produce a structured defense assessment.""" + _BOOTSTRAP_NUDGE + _FIX_SPECIFICITY_NUDGE + _FIX_PAYLOAD_CONFUSION_NUDGE + _FIX_WORKED_EXAMPLE + """
 
 Always respond with valid JSON only — no extra text before or after — in this exact format:
 {
   "threat_detected": true,
   "threat_category": "<category of threat, e.g. prompt injection / phishing / code injection>",
   "risk_score": <number 0-10, where 10 is critical>,
+  "severity": "<one of: low, medium, high, critical>",
+  "confidence": <number 0.0-1.0, how confident you are in this assessment>,
+  "explanation": "<plain-language explanation a non-expert could follow: what happened and why it's a threat>",
+  "recommended_fix": "<concrete, specific remediation a developer could actually implement to close this hole - not a generic platitude>",
   "mitigation": "<specific mitigation action you are applying>",
   "recommendations": [
     "<security recommendation 1>",
@@ -188,6 +262,19 @@ def _normalize(data: dict) -> dict:
     recs = data.get("recommendations", [])
     if isinstance(recs, str):
         data["recommendations"] = [r.strip() for r in recs.split(",") if r.strip()]
+
+    # Step 7.1 - severity/confidence/explanation/recommended_fix, with
+    # tolerant fallbacks for a model that omits them or returns them
+    # malformed, same as risk_score/recommendations above.
+    severity = str(data.get("severity") or "").strip().lower()
+    data["severity"] = severity if severity in _VALID_SEVERITIES else "medium"
+    try:
+        confidence = float(data.get("confidence"))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    data["confidence"] = max(0.0, min(1.0, confidence))
+    data["explanation"] = str(data.get("explanation") or "").strip()
+    data["recommended_fix"] = str(data.get("recommended_fix") or "").strip()
     return data
 
 
@@ -210,6 +297,10 @@ def _parse_json(raw: str, fallback_category: str) -> dict:
             "threat_detected": True,
             "threat_category": fallback_category,
             "risk_score": 5.0,
+            "severity": "medium",
+            "confidence": 0.5,
+            "explanation": raw,
+            "recommended_fix": "",
             "mitigation": raw,
             "recommendations": [],
         }
@@ -224,6 +315,9 @@ LIVE_USER_PROMPT_TEMPLATE = (
 
 class BlueTeamAgent:
     def defend_live(self, log_text: str) -> dict:
+        provider = os.getenv("LLM_PROVIDER", "ollama")
+        if provider in _REMOTE_PROVIDERS:
+            log_text = redact_text(log_text)
         raw, latency = _llm_chat(
             SYSTEM_PROMPT,
             LIVE_USER_PROMPT_TEMPLATE.format(log_text=log_text or "(no new log lines)"),

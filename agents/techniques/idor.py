@@ -109,4 +109,9 @@ IDOR = register(Technique(
     describe_attempt=_describe_attempt,
     perform_normal_action=_perform_normal_view,
     category_keywords=("idor", "insecure direct object reference", "broken object level authorization", "broken access control"),
+    # Excludes bare "authoriz"/"access control" - both are generic enough to
+    # show up in advice for almost any technique (broken_auth included)
+    # without ever mentioning that the fix is a per-object ownership check,
+    # which is the one thing that actually closes an IDOR.
+    fix_keywords=("ownership check", "owner_id", "belongs to the requester", "object-level authorization", "verify the requester owns", "compare the resource owner"),
 ))

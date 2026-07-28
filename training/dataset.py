@@ -27,6 +27,8 @@ import os
 import uuid
 from pathlib import Path
 
+from agents.safety.redact import redact_value
+
 # Store training data outside OneDrive to avoid sync lock conflicts.
 # Override with SENTINEL_DATA_DIR env var if you want a different location.
 DATA_DIR = Path(
@@ -44,7 +46,9 @@ def save_red_win(messages: list, technique_id: str) -> None:
     reproduces the exact successful <tool_call> sequence."""
     d = _examples_dir("red", technique_id)
     d.mkdir(parents=True, exist_ok=True)
-    example = {"technique": technique_id, "messages": messages}
+    # Step 6.3 - scrub secret-shaped values before this training example is
+    # ever written to disk.
+    example = {"technique": technique_id, "messages": redact_value(messages)}
     (d / f"{uuid.uuid4().hex}.json").write_text(json.dumps(example), encoding="utf-8")
 
 
@@ -55,12 +59,14 @@ def save_blue_win(attack: dict, defense: dict, system_prompt: str, user_prompt: 
     d = _examples_dir("blue", technique_id)
     d.mkdir(parents=True, exist_ok=True)
     response_payload = {k: v for k, v in defense.items() if k != "latency"}
+    # Step 6.3 - scrub secret-shaped values before this training example is
+    # ever written to disk.
     example = {
         "technique": technique_id,
         "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-            {"role": "assistant", "content": json.dumps(response_payload)},
+            {"role": "system", "content": redact_value(system_prompt)},
+            {"role": "user", "content": redact_value(user_prompt)},
+            {"role": "assistant", "content": redact_value(json.dumps(response_payload))},
         ]
     }
     path = d / f"{uuid.uuid4().hex}.json"

@@ -137,21 +137,46 @@ def _train_in_subprocess(
             force_include_file.unlink(missing_ok=True)
 
 
+# A training subprocess crashing with STATUS_ACCESS_VIOLATION (3221225477 /
+# 0xC0000005) has been observed on Windows specifically when this parent
+# process already loaded+used its own quantized model for live battles just
+# before spawning the training subprocess - reproduced in isolation with a
+# minimal script containing none of this codebase's logic, so it's a
+# Windows/driver/CUDA-multi-process issue, not something fixable here. A
+# short delay + retry costs nothing (training crashes already skip cleanly -
+# see the docstring below) and gives the driver more time to fully release
+# the parent's GPU state between attempts.
+_TRAIN_CRASH_RETRIES = 2
+_TRAIN_CRASH_RETRY_DELAY_SECONDS = 8
+
+
 def _train_safely(agent: str, max_examples: int, technique: str | None = None, force_include_paths: list[str] | None = None) -> bool:
     """Wraps _train_in_subprocess so a training crash (GPU contention with
     another process, a driver-level crash, OOM, etc.) costs this round's
     training and nothing else - without this, an unhandled
     CalledProcessError propagates out of run_loop() and kills the entire
     multi-round run, including every round after the one that happened to
-    crash. Returns whether training actually completed."""
-    try:
-        _train_in_subprocess(agent, max_examples, technique=technique, force_include_paths=force_include_paths)
-        return True
-    except subprocess.CalledProcessError as exc:
-        print(f"\n  !! {agent.upper()} team training crashed (exit code {exc.returncode}) - "
-              f"skipping this round's training and continuing. If this keeps happening, check "
-              f"whether another GPU-heavy process is running at the same time.")
-        return False
+    crash. Retries a fixed number of times with a short delay first, since
+    this kind of crash has been observed to be a transient parent/child GPU
+    handoff issue rather than a deterministic one. Returns whether training
+    actually completed."""
+    attempt = 0
+    while True:
+        try:
+            _train_in_subprocess(agent, max_examples, technique=technique, force_include_paths=force_include_paths)
+            return True
+        except subprocess.CalledProcessError as exc:
+            attempt += 1
+            if attempt > _TRAIN_CRASH_RETRIES:
+                print(f"\n  !! {agent.upper()} team training crashed (exit code {exc.returncode}) after "
+                      f"{attempt} attempt(s) - skipping this round's training and continuing. If this keeps "
+                      f"happening, check whether another GPU-heavy process is running at the same time, or "
+                      f"whether a recent NVIDIA driver update introduced a regression - exit code 3221225477 "
+                      f"is STATUS_ACCESS_VIOLATION, a native CUDA crash below the level Python can catch.")
+                return False
+            print(f"\n  !! {agent.upper()} team training crashed (exit code {exc.returncode}) - retrying in "
+                  f"{_TRAIN_CRASH_RETRY_DELAY_SECONDS}s (attempt {attempt}/{_TRAIN_CRASH_RETRIES})...")
+            time.sleep(_TRAIN_CRASH_RETRY_DELAY_SECONDS)
 
 
 def run_loop(
@@ -224,7 +249,10 @@ def _zero_session_stat(tech, status: str) -> dict:
     return {
         "id": tech.id, "display_name": tech.display_name, "status": status, "elapsed_seconds": 0.0,
         "attack_battles": 0, "attack_successes": 0, "detections": 0, "normal_battles": 0, "false_positives": 0,
+        "fix_proposed": 0, "fix_verified": 0,
+        "real_attack_battles": 0, "real_attack_successes": 0,
         "red_attack_success_rate": None, "blue_detection_rate": None, "blue_false_positive_rate": None,
+        "blue_fix_verified_rate": None,
     }
 
 
@@ -240,6 +268,10 @@ def _session_stat_from_progress(tech, status: str, elapsed_seconds: float, basel
     detections = after["total_detections"] - baseline["total_detections"]
     normal_battles = after["total_normal_battles"] - baseline["total_normal_battles"]
     false_positives = after["total_false_positives"] - baseline["total_false_positives"]
+    fix_proposed = after["total_fix_proposed"] - baseline["total_fix_proposed"]
+    fix_verified = after["total_fix_verified"] - baseline["total_fix_verified"]
+    real_attack_battles = after["total_real_attack_battles"] - baseline["total_real_attack_battles"]
+    real_attack_successes = after["total_real_attack_successes"] - baseline["total_real_attack_successes"]
     return {
         "id": tech.id,
         "display_name": tech.display_name,
@@ -250,9 +282,17 @@ def _session_stat_from_progress(tech, status: str, elapsed_seconds: float, basel
         "detections": detections,
         "normal_battles": normal_battles,
         "false_positives": false_positives,
-        "red_attack_success_rate": attack_successes / attack_battles if attack_battles else None,
+        "fix_proposed": fix_proposed,
+        "fix_verified": fix_verified,
+        "real_attack_battles": real_attack_battles,
+        "real_attack_successes": real_attack_successes,
+        # Step 5.3 - computed from real_* (excludes distractor-target
+        # battles, which are deliberately unexploitable) so this doesn't
+        # structurally cap out below 100% regardless of red's actual skill.
+        "red_attack_success_rate": real_attack_successes / real_attack_battles if real_attack_battles else None,
         "blue_detection_rate": detections / attack_battles if attack_battles else None,
         "blue_false_positive_rate": false_positives / normal_battles if normal_battles else None,
+        "blue_fix_verified_rate": fix_verified / fix_proposed if fix_proposed else None,
     }
 
 
@@ -442,6 +482,10 @@ def _run_loop_locked(
     total_detections = progress["total_detections"]
     total_normal_battles = progress["total_normal_battles"]
     total_false_positives = progress["total_false_positives"]
+    total_fix_proposed = progress["total_fix_proposed"]
+    total_fix_verified = progress["total_fix_verified"]
+    total_real_attack_battles = progress["total_real_attack_battles"]
+    total_real_attack_successes = progress["total_real_attack_successes"]
 
     try:
         for round_num in range(1, rounds + 1):
@@ -464,6 +508,17 @@ def _run_loop_locked(
             detections = 0
             normal_battles = 0
             false_positives = 0
+            fix_proposed = 0
+            fix_verified = 0
+            # real_* excludes distractor-target attack battles (Step 5.3) -
+            # those are deliberately unexploitable, so counting them toward
+            # red's success rate structurally caps it below 100% regardless
+            # of red's actual skill. This is what red_attack_success_rate is
+            # computed from everywhere below; attack_battles/attack_successes
+            # above still count every attack round (including distractor),
+            # since that's the correct denominator for blue's detection rate.
+            real_attack_battles = 0
+            real_attack_successes = 0
             round_start = time.time()
 
             # Paths of blue_wins saved THIS round - passed to
@@ -494,10 +549,13 @@ def _run_loop_locked(
 
                 result = run_simulation(target_url=battle_target_url, technique=technique)
 
-                attack  = result["attack"]
-                defense = result["defense"]
-                verdict = result["evaluation"]
-                was_attack = attack.get("was_attack", True)
+                attack      = result["attack"]
+                defense     = result["defense"]
+                verdict     = result["evaluation"]
+                remediation = result.get("remediation", {})
+                was_attack  = attack.get("was_attack", True)
+
+                is_distractor = picked_target is not None and picked_target.role == "distractor"
 
                 if was_attack:
                     attack_battles += 1
@@ -508,12 +566,30 @@ def _run_loop_locked(
                     if verdict.get("detection_correct"):
                         detections += 1
                         total_detections += 1
+                    if not is_distractor:
+                        real_attack_battles += 1
+                        total_real_attack_battles += 1
+                        if verdict.get("attack_success"):
+                            real_attack_successes += 1
+                            total_real_attack_successes += 1
                 else:
                     normal_battles += 1
                     total_normal_battles += 1
                     if verdict.get("false_positives"):
                         false_positives += 1
                         total_false_positives += 1
+
+                # Step 7.3: fix verification is a second, independent signal
+                # from detection accuracy - it only ever fires on a battle
+                # where verify_fix() actually attempted a replay (see
+                # agents/judge/verification.py), which requires a real
+                # successful attack and a non-empty recommended_fix.
+                if remediation.get("attempted"):
+                    fix_proposed += 1
+                    total_fix_proposed += 1
+                    if remediation.get("fix_verified"):
+                        fix_verified += 1
+                        total_fix_verified += 1
 
                 # Step 4.2: log every battle (not just wins) with its full
                 # transcript, reward, and the adapter version each side played
@@ -535,6 +611,7 @@ def _run_loop_locked(
                     target_id=picked_target.id if picked_target else None,
                     target_role=picked_target.role if picked_target else None,
                     target_framework=picked_target.framework if picked_target else None,
+                    remediation=remediation,
                 )
 
                 # Persist the running totals after every battle (not just
@@ -548,6 +625,10 @@ def _run_loop_locked(
                     "total_detections": total_detections,
                     "total_normal_battles": total_normal_battles,
                     "total_false_positives": total_false_positives,
+                    "total_fix_proposed": total_fix_proposed,
+                    "total_fix_verified": total_fix_verified,
+                    "total_real_attack_battles": total_real_attack_battles,
+                    "total_real_attack_successes": total_real_attack_successes,
                 })
 
                 # Step 4.3 (live): one point per battle, on a running
@@ -555,11 +636,12 @@ def _run_loop_locked(
                 # curve is visible while a round is still in progress
                 # instead of only appearing once the round completes.
                 if live_writer is not None:
-                    if total_attack_battles:
+                    if total_real_attack_battles:
                         live_writer.add_scalar(
                             f"live/{technique}/cumulative_red_attack_success_rate",
-                            total_attack_successes / total_attack_battles, total_attack_battles,
+                            total_real_attack_successes / total_real_attack_battles, total_real_attack_battles,
                         )
+                    if total_attack_battles:
                         live_writer.add_scalar(
                             f"live/{technique}/cumulative_blue_detection_rate",
                             total_detections / total_attack_battles, total_attack_battles,
@@ -568,6 +650,11 @@ def _run_loop_locked(
                         live_writer.add_scalar(
                             f"live/{technique}/cumulative_false_positive_rate",
                             total_false_positives / total_normal_battles, total_normal_battles,
+                        )
+                    if total_fix_proposed:
+                        live_writer.add_scalar(
+                            f"live/{technique}/cumulative_fix_verified_rate",
+                            total_fix_verified / total_fix_proposed, total_fix_proposed,
                         )
                     live_writer.add_scalar(
                         f"live/{technique}/battle_quality",
@@ -597,17 +684,37 @@ def _run_loop_locked(
                     saved_path = save_blue_win(attack, defense, BLUE_SYSTEM, blue_user_prompt, example_technique)
                     this_round_blue_win_paths.append(saved_path)
 
+                    # Step 7.3: fix verification is a second reward signal,
+                    # separate from detection accuracy. Training here is SFT
+                    # on saved winning examples, not RL with a scalar reward,
+                    # so the signal is realized as oversampling: a battle
+                    # where blue both detected the attack AND proposed a fix
+                    # verified (via a real replay against the patched
+                    # distractor target) to actually close the hole gets
+                    # this exact example saved a second time, so it's
+                    # naturally overrepresented in blue's training batch
+                    # relative to a detection-only win with an unverified or
+                    # wrong fix - without changing detection's own gate above
+                    # or touching training/dataset.py's selection logic.
+                    if remediation.get("fix_verified"):
+                        extra_path = save_blue_win(attack, defense, BLUE_SYSTEM, blue_user_prompt, example_technique)
+                        this_round_blue_win_paths.append(extra_path)
+
                 quality = verdict.get("defense_quality", 0)
                 mode = "attack" if was_attack else "normal"
                 print(f"mode={mode:<6}  attack_success={str(verdict.get('attack_success')):<5}  "
                       f"detected={str(verdict.get('detection_correct')):<5}  quality={quality:.1f}  "
-                      f"(AS:{attack_successes}/{attack_battles} DET:{detections}/{attack_battles} FP:{false_positives}/{normal_battles})")
+                      f"fix_verified={remediation.get('fix_verified')}  "
+                      f"(AS:{real_attack_successes}/{real_attack_battles} DET:{detections}/{attack_battles} "
+                      f"FP:{false_positives}/{normal_battles} FIXV:{fix_verified}/{fix_proposed})")
 
             round_time = round(time.time() - round_start, 1)
             print(f"\n  Round {round_num} complete in {round_time}s")
-            print(f"  Red attack success {attack_successes}/{attack_battles}  |  "
+            print(f"  Red attack success {real_attack_successes}/{real_attack_battles} "
+                  f"(excl. {attack_battles - real_attack_battles} distractor rounds)  |  "
                   f"Blue detection {detections}/{attack_battles}  |  "
-                  f"False positives {false_positives}/{normal_battles}")
+                  f"False positives {false_positives}/{normal_battles}  |  "
+                  f"Fix verified {fix_verified}/{fix_proposed}")
 
             # Log stats for tracking improvement over time. Keyed on
             # global_round (persisted, never resets) rather than the local
@@ -615,9 +722,9 @@ def _run_loop_locked(
             # a round number - that collision used to make this file (and
             # the matching TensorBoard chart) look like nonsense once you'd
             # restarted training more than once.
-            _log_stats(global_round, technique, attack_battles, attack_successes, detections, normal_battles, false_positives, round_time)
+            _log_stats(global_round, technique, attack_battles, attack_successes, detections, normal_battles, false_positives, fix_proposed, fix_verified, round_time, real_attack_battles, real_attack_successes)
             if round_writer is not None:
-                _log_tensorboard_round(round_writer, technique, global_round, attack_battles, attack_successes, detections, normal_battles, false_positives)
+                _log_tensorboard_round(round_writer, technique, global_round, attack_battles, attack_successes, detections, normal_battles, false_positives, fix_proposed, fix_verified, real_attack_battles, real_attack_successes)
 
             # Unload inference models and Ollama judge before training to free VRAM
             _unload_inference_models()
@@ -712,31 +819,44 @@ def _unload_inference_models() -> None:
     _mem_checkpoint("battle_loop: after unloading inference models")
 
 
-def _log_stats(round_num, technique, attack_battles, attack_successes, detections, normal_battles, false_positives, elapsed):
+def _log_stats(round_num, technique, attack_battles, attack_successes, detections, normal_battles, false_positives, fix_proposed, fix_verified, elapsed, real_attack_battles, real_attack_successes):
     STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "round": round_num,
         "technique": technique,
         "attack_battles": attack_battles,
         "attack_successes": attack_successes,
+        # Step 5.3 - excludes distractor-target rounds, which are
+        # deliberately unexploitable; see agents/safety plan notes /
+        # training/progress_state.py for why this differs from
+        # attack_battles/attack_successes above (still the right
+        # denominator for blue_detection_rate).
+        "real_attack_battles": real_attack_battles,
+        "real_attack_successes": real_attack_successes,
         "detections": detections,
         "normal_battles": normal_battles,
         "false_positives": false_positives,
-        "red_attack_success_rate": round(attack_successes / attack_battles, 3) if attack_battles else 0,
+        "fix_proposed": fix_proposed,
+        "fix_verified": fix_verified,
+        "red_attack_success_rate": round(real_attack_successes / real_attack_battles, 3) if real_attack_battles else 0,
         "blue_detection_rate": round(detections / attack_battles, 3) if attack_battles else 0,
         "blue_false_positive_rate": round(false_positives / normal_battles, 3) if normal_battles else 0,
+        "blue_fix_verified_rate": round(fix_verified / fix_proposed, 3) if fix_proposed else 0,
         "elapsed_seconds": elapsed,
     }
     with open(STATS_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
 
-def _log_tensorboard_round(writer, technique, global_round, attack_battles, attack_successes, detections, normal_battles, false_positives) -> None:
+def _log_tensorboard_round(writer, technique, global_round, attack_battles, attack_successes, detections, normal_battles, false_positives, fix_proposed, fix_verified, real_attack_battles, real_attack_successes) -> None:
     """Step 4.3: round-level scalars - red's attack success rate and blue's
     detection rate tracked independently (not collapsed into a win/loss/
     draw), plus blue's false-positive rate on normal-traffic rounds - so
     training-time progress is plottable next to eval_harness.py's held-out
     numbers (which use this same framing) in the same TensorBoard instance.
+    Step 7.3 adds fix_verified_rate alongside them - blue's remediation
+    signal, tracked independently from detection the same way false positives
+    already are.
 
     Takes an already-open writer (opened once per run_loop() call) rather
     than opening its own per round - both to stop fragmenting the log
@@ -744,11 +864,14 @@ def _log_tensorboard_round(writer, technique, global_round, attack_battles, atta
     is now a persisted, ever-increasing number (training/progress_state.py),
     so points from different process runs extend the same line instead of
     overlapping it."""
+    if real_attack_battles:
+        writer.add_scalar(f"rounds/{technique}/red_attack_success_rate", real_attack_successes / real_attack_battles, global_round)
     if attack_battles:
-        writer.add_scalar(f"rounds/{technique}/red_attack_success_rate", attack_successes / attack_battles, global_round)
         writer.add_scalar(f"rounds/{technique}/blue_detection_rate", detections / attack_battles, global_round)
     if normal_battles:
         writer.add_scalar(f"rounds/{technique}/false_positive_rate", false_positives / normal_battles, global_round)
+    if fix_proposed:
+        writer.add_scalar(f"rounds/{technique}/fix_verified_rate", fix_verified / fix_proposed, global_round)
     writer.flush()
 
 

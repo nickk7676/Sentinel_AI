@@ -101,4 +101,11 @@ SQL_INJECTION = register(Technique(
     describe_attempt=_describe_attempt,
     perform_normal_action=_perform_normal_login,
     category_keywords=("sql injection", "sqli", "sql"),
+    # Deliberately excludes generic terms like "sanitiz"/"input validation"/
+    # "escap" - those show up in boilerplate security advice regardless of
+    # technique (and naive blacklist-style "sanitization" famously doesn't
+    # even fix SQLi), so they'd let a vague non-answer pass as a correct fix.
+    # Every phrase below requires actually naming the real mechanism
+    # (separating query structure from data).
+    fix_keywords=("parameteriz", "prepared statement", "bind variable", "bound parameter", "parametrized quer"),
 ))

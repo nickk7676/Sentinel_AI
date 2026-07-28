@@ -29,6 +29,23 @@ _DEFAULT_STATE = {
     "total_detections": 0,
     "total_normal_battles": 0,
     "total_false_positives": 0,
+    # Step 7.3 - cumulative counts of battles where blue proposed a fix that
+    # was actually checked (fix_proposed) vs. checked and confirmed to close
+    # the hole (fix_verified). fix_proposed <= total_detections, since
+    # verification only ever runs on a real, successfully-detected attack.
+    "total_fix_proposed": 0,
+    "total_fix_verified": 0,
+    # Distractor targets (training/targets.py) are deliberately unexploitable
+    # (patched vuln, alarming-looking logs) so blue learns precision, not so
+    # red has something to succeed against - counting them toward red's own
+    # success-rate denominator structurally caps it below 100% regardless of
+    # red's real skill. These track attack battles/successes against
+    # non-distractor targets only, which is what red_attack_success_rate
+    # should actually be computed from; total_attack_battles/successes above
+    # keep counting every attack round (including distractor) since that's
+    # the right denominator for blue's detection rate.
+    "total_real_attack_battles": 0,
+    "total_real_attack_successes": 0,
 }
 
 

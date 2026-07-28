@@ -214,6 +214,16 @@ def render_attack_chain(history: list):
                 st.markdown(f"**Category:** {defense.get('threat_category', 'unknown')}")
                 risk = float(defense.get("risk_score") or 0)
                 st.progress(min(risk / 10.0, 1.0), text=f"Risk Score: {risk}/10")
+                blue_sev = defense.get("severity", "medium")
+                st.markdown(
+                    f"**Severity:** <span class='{severity_color(blue_sev)}'>{blue_sev.upper()}</span>  "
+                    f"(confidence: {float(defense.get('confidence') or 0):.0%})",
+                    unsafe_allow_html=True,
+                )
+                if defense.get("explanation"):
+                    st.markdown(f"**Explanation:** {defense['explanation']}")
+                if defense.get("recommended_fix"):
+                    st.markdown(f"**Recommended Fix:** {defense['recommended_fix']}")
                 st.markdown(f"**Mitigation:** {defense.get('mitigation', '')}")
                 recs = defense.get("recommendations", [])
                 if isinstance(recs, str):
@@ -237,6 +247,15 @@ def render_attack_chain(history: list):
                 st.metric("Recall",          f"{evaluation.get('recall', 0):.2f}")
                 st.metric("Defense Quality", f"{evaluation.get('defense_quality', 0):.1f}/10")
                 st.metric("Latency Rating",  f"{evaluation.get('response_latency_rating', 0):.1f}/10")
+
+                remediation = sim.get("remediation", {})
+                if remediation.get("attempted"):
+                    verified = remediation.get("fix_verified")
+                    st.markdown(
+                        f"**Fix Verified:** {'✅ Yes' if verified else '❌ No'}  \n"
+                        f"<span style='font-size:0.85em;color:var(--text-secondary,#888)'>{remediation.get('reason', '')}</span>",
+                        unsafe_allow_html=True,
+                    )
                 st.markdown(f"**False Positives:** {evaluation.get('false_positives', 0)}")
                 st.markdown(f"**Reasoning:** {evaluation.get('reasoning', '')}")
 
@@ -399,6 +418,16 @@ with tab2:
                 col1.markdown(f"**Category:** {defense.get('threat_category', '?')}")
                 risk = float(defense.get("risk_score") or 0)
                 col2.progress(min(risk / 10.0, 1.0), text=f"Risk Score: {risk}/10")
+                blue_sev = defense.get("severity", "medium")
+                col2.markdown(
+                    f"**Severity:** <span class='{severity_color(blue_sev)}'>{blue_sev.upper()}</span>  "
+                    f"(confidence: {float(defense.get('confidence') or 0):.0%})",
+                    unsafe_allow_html=True,
+                )
+                if defense.get("explanation"):
+                    st.markdown(f"**Explanation:** {defense['explanation']}")
+                if defense.get("recommended_fix"):
+                    st.markdown(f"**Recommended Fix:** {defense['recommended_fix']}")
                 st.markdown(f"**Mitigation:** {defense.get('mitigation', '')}")
                 recs = defense.get("recommendations", [])
                 if recs:
@@ -418,6 +447,12 @@ with tab2:
                 col2.metric("False Positives",  evaluation.get("false_positives", 0))
                 st.markdown(f"**Reasoning:** {evaluation.get('reasoning', '')}")
                 st.caption(f"Judge latency: {evaluation.get('judge_latency', 0):.3f}s")
+
+                remediation = latest.get("remediation", {})
+                if remediation.get("attempted"):
+                    verified = remediation.get("fix_verified")
+                    st.markdown(f"**Fix Verified (Step 7):** {'✅ Yes' if verified else '❌ No'}")
+                    st.caption(remediation.get("reason", ""))
 
             if len(st.session_state.simulation_history) > 1:
                 st.markdown("---")

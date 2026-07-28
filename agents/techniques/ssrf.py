@@ -107,4 +107,10 @@ SSRF = register(Technique(
     describe_attempt=_describe_attempt,
     perform_normal_action=_perform_normal_preview,
     category_keywords=("ssrf", "server-side request forgery", "internal service", "metadata"),
+    # Excludes bare "allowlist"/"whitelist" - generic enough to appear for
+    # almost any technique without ever confirming the fix actually blocks
+    # requests to internal/private address space, which is what stops SSRF
+    # specifically (an allowlist of e.g. "commands" or "file extensions"
+    # elsewhere in this codebase would falsely match otherwise).
+    fix_keywords=("block requests to internal", "deny access to private ip", "block loopback", "block link-local", "169.254", "allowlist of permitted destination", "resolve and validate the destination ip", "block metadata endpoint"),
 ))

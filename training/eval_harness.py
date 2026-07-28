@@ -80,8 +80,9 @@ def _run_batch(
     n: int,
     red_version: int,
     blue_version: int,
-) -> list[dict]:
+) -> tuple[list[dict], list[dict]]:
     verdicts = []
+    remediations = []
     for i in range(1, n + 1):
         result = run_simulation(
             target_url=target_url,
@@ -89,6 +90,7 @@ def _run_batch(
             normal_traffic_probability=normal_traffic_probability,
         )
         attack, defense, verdict = result["attack"], result["defense"], result["evaluation"]
+        remediation = result.get("remediation", {})
         log_battle(
             source="eval",
             technique=technique_id,
@@ -103,14 +105,17 @@ def _run_batch(
             target_id=target.id,
             target_role=target.role,
             target_framework=target.framework,
+            remediation=remediation,
         )
         verdicts.append(verdict)
-    return verdicts
+        remediations.append(remediation)
+    return verdicts, remediations
 
 
-def _summarize(attack_verdicts: list[dict], normal_verdicts: list[dict]) -> dict:
+def _summarize(attack_verdicts: list[dict], normal_verdicts: list[dict], attack_remediations: list[dict] | None = None) -> dict:
     n_attack = len(attack_verdicts)
     n_normal = len(normal_verdicts)
+    attack_remediations = attack_remediations or []
 
     detection_rate = (
         sum(1 for v in attack_verdicts if v.get("detection_correct")) / n_attack if n_attack else 0.0
@@ -127,6 +132,13 @@ def _summarize(attack_verdicts: list[dict], normal_verdicts: list[dict]) -> dict
     recall = (
         sum(v.get("recall", 0.0) for v in attack_verdicts) / n_attack if n_attack else 0.0
     )
+    # Step 7: fraction of battles where blue's recommended_fix was actually
+    # checked (a real attack succeeded and blue proposed something) and, of
+    # those, the fraction confirmed (via a live replay - see
+    # agents/judge/verification.py) to actually close the hole.
+    n_fix_proposed = sum(1 for r in attack_remediations if r.get("attempted"))
+    n_fix_verified = sum(1 for r in attack_remediations if r.get("fix_verified"))
+    fix_verified_rate = n_fix_verified / n_fix_proposed if n_fix_proposed else 0.0
 
     return {
         "attack_battles": n_attack,
@@ -136,6 +148,9 @@ def _summarize(attack_verdicts: list[dict], normal_verdicts: list[dict]) -> dict
         "blue_false_positive_rate": round(false_positive_rate, 3),
         "blue_precision": round(precision, 3),
         "blue_recall": round(recall, 3),
+        "fix_proposed": n_fix_proposed,
+        "fix_verified": n_fix_verified,
+        "blue_fix_verified_rate": round(fix_verified_rate, 3),
     }
 
 
@@ -147,6 +162,7 @@ def _rollup(summaries: list[dict]) -> dict:
     memorize the training targets."""
     n_attack_total = sum(s["attack_battles"] for s in summaries)
     n_normal_total = sum(s["normal_battles"] for s in summaries)
+    n_fix_proposed_total = sum(s.get("fix_proposed", 0) for s in summaries)
     return {
         "attack_battles": n_attack_total,
         "normal_battles": n_normal_total,
@@ -159,6 +175,11 @@ def _rollup(summaries: list[dict]) -> dict:
         "blue_false_positive_rate": round(
             sum(s["blue_false_positive_rate"] * s["normal_battles"] for s in summaries) / n_normal_total, 3
         ) if n_normal_total else 0.0,
+        "fix_proposed": n_fix_proposed_total,
+        "fix_verified": sum(s.get("fix_verified", 0) for s in summaries),
+        "blue_fix_verified_rate": round(
+            sum(s.get("blue_fix_verified_rate", 0.0) * s.get("fix_proposed", 0) for s in summaries) / n_fix_proposed_total, 3
+        ) if n_fix_proposed_total else 0.0,
     }
 
 
@@ -204,15 +225,15 @@ def run_eval(
             for target in targets:
                 target_url = _target_url(target, target_url_overrides)
                 print(f"  [{target.id}] ({target.role}/{target.framework}) target={target_url}")
-                attack_verdicts = _run_batch(
+                attack_verdicts, attack_remediations = _run_batch(
                     tech.id, target, target_url, round_num, normal_traffic_probability=0.0,
                     n=attacks_per_technique, red_version=red_version, blue_version=blue_version,
                 )
-                normal_verdicts = _run_batch(
+                normal_verdicts, _ = _run_batch(
                     tech.id, target, target_url, round_num, normal_traffic_probability=1.0,
                     n=normal_per_technique, red_version=red_version, blue_version=blue_version,
                 )
-                summary = _summarize(attack_verdicts, normal_verdicts)
+                summary = _summarize(attack_verdicts, normal_verdicts, attack_remediations)
                 summary["role"] = target.role
                 summary["framework"] = target.framework
                 target_summaries[target.id] = summary

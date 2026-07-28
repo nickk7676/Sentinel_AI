@@ -1,0 +1,7 @@
+{
+  "paused": {},
+  "consecutive_errors": {
+    "http://localhost:5101": 0,
+    "http://localhost:5304": 0
+  }
+}

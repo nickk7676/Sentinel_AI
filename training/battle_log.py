@@ -15,6 +15,7 @@ avoids OneDrive/Defender append-lock issues on Windows.
 import json
 import time
 
+from agents.safety.redact import redact_value
 from training.dataset import DATA_DIR
 
 BATTLE_LOG_FILE = DATA_DIR / "battle_log.jsonl"
@@ -35,6 +36,7 @@ def log_battle(
     target_id: str | None = None,
     target_role: str | None = None,
     target_framework: str | None = None,
+    remediation: dict | None = None,
 ) -> None:
     """Append one battle's full record.
 
@@ -49,6 +51,9 @@ def log_battle(
                  can slice by target (e.g. "train" vs "heldout"), not just
                  by technique. None for any caller that hasn't been updated
                  to pass a LabTarget (e.g. an ad hoc --target-url override).
+    remediation: Step 7.2's verify_fix() result - whether blue's proposed fix
+                 was checked and whether it actually closed the hole.
+                 Defaults to {} for any caller that hasn't been updated.
     """
     BATTLE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     entry = {
@@ -62,9 +67,13 @@ def log_battle(
         "target_role": target_role,
         "target_framework": target_framework,
         "was_attack": attack.get("was_attack", True),
-        "attack": attack,
-        "defense": defense,
+        # Step 6.3 - scrub secret-shaped values (API keys, JWTs, ...) before
+        # this ever hits disk, in case a live target ever returns something
+        # real-looking (e.g. once this points at more than a lab fixture).
+        "attack": redact_value(attack),
+        "defense": redact_value(defense),
         "verdict": verdict,
+        "remediation": remediation or {},
         "red_adapter_version": red_adapter_version,
         "blue_adapter_version": blue_adapter_version,
     }
