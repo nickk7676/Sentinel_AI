@@ -74,6 +74,73 @@ def save_blue_win(attack: dict, defense: dict, system_prompt: str, user_prompt: 
     return str(path)
 
 
+_ROUTER_EXAMPLES_DIR = DATA_DIR / "router_wins"
+
+
+def save_router_example(system_prompt: str, user_prompt: str, decision: dict, correct_technique_id: str) -> str:
+    """Step 8's router training example: given this exact state+available-
+    techniques prompt, the correct RouterDecision was `decision` (whose
+    technique_id is always correct_technique_id - see
+    agents/red_team/router/build_router_dataset.py, the only caller).
+
+    Router is a single shared adapter across every decision, like blue, not
+    split per technique like red - but unlike blue there's no need for a
+    joint-training cap/breakdown scheme (get_data_path_all below): router's
+    "technique" tag is kept as plain metadata on each example for later
+    analysis, not a directory split, since there's exactly one router
+    adapter and get_router_data_path's caller (train_router.py) always
+    trains on the whole pool at once."""
+    _ROUTER_EXAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+    # Step 6.3 - scrub secret-shaped values before this training example is
+    # ever written to disk.
+    example = {
+        "technique": correct_technique_id,
+        "messages": [
+            {"role": "system", "content": redact_value(system_prompt)},
+            {"role": "user", "content": redact_value(user_prompt)},
+            {"role": "assistant", "content": redact_value(json.dumps(decision))},
+        ],
+    }
+    path = _ROUTER_EXAMPLES_DIR / f"{uuid.uuid4().hex}.json"
+    path.write_text(json.dumps(example), encoding="utf-8")
+    return str(path)
+
+
+def reset_router_examples() -> int:
+    """Delete every saved router example and return how many were removed.
+
+    The router dataset is now rebuilt deterministically from ground truth
+    (agents/red_team/router/build_router_dataset.py) rather than accumulated
+    across runs, so the builder clears the pool first - this guarantees the
+    pool is EXACTLY the current ground-truth set, with no stale or
+    differently-labeled files surviving from an earlier build. (This is the
+    safeguard against the retired win-mining path ever leaving a mislabeled
+    example behind in the pool.)"""
+    if not _ROUTER_EXAMPLES_DIR.exists():
+        return 0
+    removed = 0
+    for f in _ROUTER_EXAMPLES_DIR.glob("*.json"):
+        f.unlink()
+        removed += 1
+    return removed
+
+
+def count_router_examples() -> int:
+    if not _ROUTER_EXAMPLES_DIR.exists():
+        return 0
+    return len(list(_ROUTER_EXAMPLES_DIR.glob("*.json")))
+
+
+def get_router_data_path(max_examples: int | None = None) -> list[str]:
+    """Return router example file paths, newest first, capped at max_examples."""
+    if not _ROUTER_EXAMPLES_DIR.exists():
+        return []
+    files = sorted(_ROUTER_EXAMPLES_DIR.glob("*.json"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if max_examples is not None:
+        files = files[:max_examples]
+    return [str(f) for f in files]
+
+
 def count_examples(agent_name: str, technique_id: str) -> int:
     d = _examples_dir(agent_name, technique_id)
     if not d.exists():

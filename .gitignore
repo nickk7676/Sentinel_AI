@@ -45,3 +45,7 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# --- Scratch run logs (smoke tests / crash probes / battle watch output) ---
+# Regenerable byproducts of running the agents locally, not source.
+*.log
