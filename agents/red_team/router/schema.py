@@ -48,10 +48,18 @@ class BattleState:
     techniques_tried: list[dict] = field(default_factory=list)
     turn_count: int = 0
     # Freeform breadcrumbs about reusable artifacts a technique's outcome
-    # surfaced (a leaked token, a discovered credential, an id) - not
-    # consumed by anything in this pass, but this is the field 8.3's future
-    # chained-attack tooling reads from, so its shape is settled now.
+    # surfaced (a leaked token, a discovered credential, an id). Rendered into
+    # the router's prompt so a later decision can reason about what earlier
+    # steps found - this is how the router recognizes a chain is half-done and
+    # picks the follow-on technique (Step 8.3).
     chain_notes: list[str] = field(default_factory=list)
+    # Structured form of the same reusable artifacts (key -> value), as
+    # opposed to chain_notes' human-readable lines. battle_runner.py hands
+    # this dict to the next technique's run_live_attack(chain_context=...) so
+    # the follow-on step can actually use a stolen token/id, not just read
+    # about it. Kept structured (not parsed back out of chain_notes) so the
+    # value passed downstream is exact.
+    artifacts: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

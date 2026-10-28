@@ -26,6 +26,16 @@ def new_state() -> BattleState:
     return BattleState()
 
 
+def artifact_note(artifacts: dict) -> str:
+    """The exact chain_notes line recorded when a step surfaces reusable
+    artifacts (Step 8.3). Centralized here so update_state() (at battle time)
+    and build_router_dataset.py (synthesizing the post-leak training state)
+    produce byte-identical text - the router keys its follow-on decision on
+    this line, so the training state must match the live one exactly."""
+    pairs = ", ".join(f"{k}={v}" for k, v in artifacts.items())
+    return f"reusable artifact(s) obtained from an earlier step: {pairs}"
+
+
 def update_state(state: BattleState, event: ReconFinding | dict) -> BattleState:
     """event is either a ReconFinding (from a recon tool call, recon.py) or
     a technique outcome dict shaped like agents.red_team.live_tools.
@@ -48,6 +58,17 @@ def update_state(state: BattleState, event: ReconFinding | dict) -> BattleState:
             "payload": outcome.get("payload", ""),
         },
     })
+
+    # Record reusable artifacts this step surfaced (Step 8.3), whether or not
+    # it was a terminal win - a step can leak a token (an artifact) without
+    # itself reaching the canary, and that leak is exactly what lets the
+    # router pick a follow-on technique next.
+    new_artifacts = outcome.get("artifacts") or {}
+    if isinstance(new_artifacts, dict) and new_artifacts:
+        fresh = {k: v for k, v in new_artifacts.items() if state.artifacts.get(k) != v}
+        if fresh:
+            state.artifacts.update(fresh)
+            state.chain_notes.append(artifact_note(fresh))
 
     if outcome.get("success"):
         winning_call = next(

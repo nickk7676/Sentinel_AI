@@ -42,6 +42,18 @@ from agents.techniques import list_techniques
 from training.targets import TARGETS
 
 
+# Step 8.3 - a chained target's correct OPENING pick is its first chain step
+# (steal the token), not its terminal technique_id (the takeover that only
+# becomes correct once the token is in hand). The second decision can only be
+# scored inside a live battle, so this one-shot first-pick eval just checks the
+# opening move for chain targets.
+_CHAIN_OPENING = {"chained_privesc": "token_leak"}
+
+
+def _expected_pick(target) -> str:
+    return _CHAIN_OPENING.get(target.id, target.technique_id)
+
+
 def _eval_targets(targets: list, trials: int) -> None:
     all_tech = [t.id for t in list_techniques()]
 
@@ -61,15 +73,16 @@ def _eval_targets(targets: list, trials: int) -> None:
         if trials > 1:
             print(f"\n=== TRIAL {trial + 1}/{trials} ===", flush=True)
         for t in targets:
+            expected = _expected_pick(t)
             d = decide(states[t.id], list(all_tech), recon_exhausted=True)
             pick = d.technique_id if d.action == "invoke_technique" else f"({d.action})"
-            ok = d.action == "invoke_technique" and d.technique_id == t.technique_id
+            ok = d.action == "invoke_technique" and d.technique_id == expected
             correct += ok
             total += 1
-            per_tech_correct[t.technique_id] += ok
-            per_tech_total[t.technique_id] += 1
-            first_picks[t.technique_id][pick] += 1
-            print(f"  {t.id:30s} true={t.technique_id:16s} picked={pick:18s} {'OK' if ok else 'x  <-- MISS'}", flush=True)
+            per_tech_correct[expected] += ok
+            per_tech_total[expected] += 1
+            first_picks[expected][pick] += 1
+            print(f"  {t.id:30s} expect={expected:16s} picked={pick:18s} {'OK' if ok else 'x  <-- MISS'}", flush=True)
 
     print("\n" + "=" * 64)
     print(f"  FIRST-PICK ACCURACY: {correct}/{total} = {100 * correct / total:.0f}%" if total else "  (no targets evaluated)")

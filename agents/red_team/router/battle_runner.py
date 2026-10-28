@@ -131,6 +131,7 @@ def run_router_battle(
     target_url: str,
     max_decision_points: int = 6,
     max_turns_per_technique: int | None = None,
+    blue_analysis: bool = False,
 ) -> dict:
     """max_decision_points=6 is a first guess, not a measured value - once
     you've run a handful of real sessions, look at how many decision points
@@ -139,8 +140,25 @@ def run_router_battle(
 
     max_turns_per_technique: passed through to run_live_attack() as
     max_turns - leave as None to use each technique's own Technique.max_turns
-    default (agents/techniques/base.py)."""
+    default (agents/techniques/base.py).
+
+    blue_analysis: Step 8.4 - when True, after the battle blue reads the whole
+    log window this battle produced and returns a correlated assessment
+    (BlueTeamAgent.defend_live_window), surfaced as result["blue_assessment"].
+    Off by default so a pure red-dispatch run doesn't pay to load the blue
+    model."""
     assert_in_scope(target_url)
+
+    # Step 8.4: remember where the target's log stands now, so the post-battle
+    # correlation window is exactly THIS battle's events, not every prior
+    # battle's against the same long-running target.
+    blue_start_offset = 0
+    if blue_analysis:
+        from agents.blue_team.live_tools import fetch_new_logs
+        try:
+            _, blue_start_offset = fetch_new_logs(target_url, 0)
+        except Exception as exc:  # noqa: BLE001 - telemetry is best-effort
+            print(f"  [Blue] could not read starting telemetry offset: {exc}")
 
     state = new_state()
     pending_paths = _initial_recon(target_url, state)
@@ -189,7 +207,24 @@ def run_router_battle(
             # training/battle_loop.py already documents for its own
             # subprocess-isolated training step (_train_in_subprocess).
             unload_router_model()
-            kwargs = {"max_turns": max_turns_per_technique} if max_turns_per_technique is not None else {}
+            # normal_traffic_probability=0.0: run_live_attack() otherwise has a
+            # ~17.5% chance of doing a benign no-op instead of attacking, which
+            # exists only to feed blue negative (no-attack) training examples.
+            # In a router-driven dispatch the whole point is to actually find
+            # what's exploitable, so that dice roll is pure sabotage here: if it
+            # lands on the CORRECT technique the attack silently no-ops, the
+            # router records a false failure and moves on to wrong techniques.
+            # That is exactly what made a correctly-routed command_injection
+            # battle look like a total loss. Blue's negative examples come from
+            # the training loop (battle_loop.py), not from this dispatch path.
+            kwargs = {"normal_traffic_probability": 0.0}
+            if max_turns_per_technique is not None:
+                kwargs["max_turns"] = max_turns_per_technique
+            # Hand this technique whatever earlier steps already stole (Step
+            # 8.3 chaining): e.g. a reset_token leaked by token_leak flows into
+            # account_takeover here. Empty on a normal single-step battle.
+            if state.artifacts:
+                kwargs["chain_context"] = dict(state.artifacts)
             outcome = run_live_attack(decision.technique_id, target_url, **kwargs)
             print(f"  [{decision.technique_id}] success={outcome.get('success')}  tool_calls={len(outcome.get('tool_calls', []))}")
             _unload_technique_models()
@@ -235,6 +270,28 @@ def run_router_battle(
         chain_notes=state.chain_notes,
     )
 
+    # Step 8.4: blue correlates across the whole window this battle produced.
+    # Red/router models were already freed above (unload_router_model before
+    # each technique, _unload_technique_models after each), so loading blue
+    # now doesn't stack a third quantized model against the first two.
+    blue_assessment = None
+    if blue_analysis:
+        from agents.blue_team.agent import BlueTeamAgent
+        from agents.blue_team.live_tools import fetch_new_logs
+        try:
+            window_text, _ = fetch_new_logs(target_url, blue_start_offset)
+        except Exception as exc:  # noqa: BLE001 - telemetry is best-effort
+            window_text = ""
+            print(f"  [Blue] could not fetch telemetry window: {exc}")
+        print("  [Blue] correlating this battle's full log window...")
+        blue_assessment = BlueTeamAgent().defend_live_window(window_text)
+        print(f"  [Blue] chained={blue_assessment.get('chained')} "
+              f"threat_detected={blue_assessment.get('threat_detected')} "
+              f"category={blue_assessment.get('threat_category')!r} "
+              f"severity={blue_assessment.get('severity')!r}")
+        for i, step in enumerate(blue_assessment.get("attack_chain", []), 1):
+            print(f"         chain step {i}: {step}")
+
     return {
         "target_url": target_url,
         "decisions": [dataclasses.asdict(d) for d in decisions],
@@ -242,6 +299,7 @@ def run_router_battle(
         "techniques_tried": state.techniques_tried,
         "chain_notes": state.chain_notes,
         "final_state_prompt_block": to_prompt_block(state),
+        "blue_assessment": blue_assessment,
     }
 
 
@@ -256,6 +314,9 @@ if __name__ == "__main__":
                         help="Battles per round (default 1). Total battles = rounds x battles.")
     parser.add_argument("--max-decision-points", type=int, default=6)
     parser.add_argument("--max-turns-per-technique", type=int, default=None)
+    parser.add_argument("--blue-analysis", action="store_true",
+                        help="Step 8.4: after each battle, have blue correlate the whole log window and "
+                             "report whether it was a multi-step/chained attack (loads the blue model).")
     args = parser.parse_args()
 
     import os
@@ -293,6 +354,7 @@ if __name__ == "__main__":
                     target_url,
                     max_decision_points=args.max_decision_points,
                     max_turns_per_technique=args.max_turns_per_technique,
+                    blue_analysis=args.blue_analysis,
                 )
 
                 won = any(t.get("outcome", {}).get("success") for t in result["techniques_tried"])

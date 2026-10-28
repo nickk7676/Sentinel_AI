@@ -46,6 +46,7 @@ def _run_normal_action(technique, target_url: str) -> dict:
         "mitre_technique": technique.mitre_technique,
         "success": False,
         "tool_calls": [result] if result else [],
+        "artifacts": {},
         "reasoning": "Normal traffic round: a benign action was performed instead of an attack attempt.",
         "latency": round(time.time() - start, 3),
         "_live_messages": [],
@@ -71,6 +72,7 @@ def run_live_attack(
     target_url: str,
     max_turns: int | None = None,
     normal_traffic_probability: float = NORMAL_TRAFFIC_PROBABILITY,
+    chain_context: dict | None = None,
 ) -> dict:
     """Drive a real tool-calling loop, on the user's local trained model,
     against the live lab target for the given technique.
@@ -78,6 +80,15 @@ def run_live_attack(
     max_turns: defaults to the technique's own Technique.max_turns (see
     agents/techniques/base.py) when left as None - pass an explicit value
     only to override that per-technique default for this one call.
+
+    chain_context (Step 8.3 router-orchestrated chaining): reusable artifacts
+    an EARLIER technique in this battle already discovered (e.g.
+    {"reset_token": "RST-..."}), handed down by the router via
+    battle_runner.py. When non-empty it's appended to the attack's opening
+    user message so this step can actually USE what a previous step stole -
+    that's the whole mechanism that turns two single-step techniques into a
+    chain. The returned dict's "artifacts" key carries anything THIS step
+    discovered, to be folded into the battle state for the next decision.
 
     On a small fraction of calls (`normal_traffic_probability`), performs a
     real, harmless action instead of attacking, so blue gets genuine
@@ -104,9 +115,19 @@ def run_live_attack(
 
     model, tokenizer = _get_local_model(technique.id)
 
+    user_content = technique.user_prompt_template.format(target_url=target_url)
+    if chain_context:
+        # Hand this step whatever earlier steps already stole, so the router
+        # can chain techniques (Step 8.3): a later technique reuses an earlier
+        # one's loot instead of each technique running blind.
+        artifact_lines = "\n".join(f"  - {k} = {v}" for k, v in chain_context.items())
+        user_content += (
+            "\n\nReusable information already discovered in earlier steps of this engagement "
+            "(use it directly - do not re-discover it):\n" + artifact_lines
+        )
     messages = [
         {"role": "system", "content": technique.system_prompt},
-        {"role": "user", "content": technique.user_prompt_template.format(target_url=target_url)},
+        {"role": "user", "content": user_content},
     ]
 
     start = time.time()
@@ -171,6 +192,16 @@ def run_live_attack(
         if winning_call is not None:
             break
 
+    # Fold together any reusable artifacts this step's tool calls surfaced
+    # (Step 8.3) - e.g. a leaked reset_token - so the router can hand them to
+    # the next technique in the chain. Each technique's execute_tool_call
+    # opts in by putting an "artifacts" dict on its result.
+    artifacts: dict = {}
+    for call in tool_calls_made:
+        found = call.get("artifacts")
+        if isinstance(found, dict):
+            artifacts.update(found)
+
     success = winning_call is not None
     last_call = winning_call or (tool_calls_made[-1] if tool_calls_made else None)
     if last_call is None:
@@ -197,6 +228,7 @@ def run_live_attack(
         "mitre_technique": technique.mitre_technique,
         "success": success,
         "tool_calls": tool_calls_made,
+        "artifacts": artifacts,
         "reasoning": final_text,
         "latency": round(time.time() - start, 3),
         "_live_messages": messages,

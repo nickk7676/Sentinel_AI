@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -83,6 +84,105 @@ WRONG recommended_fix: "../../../etc/passwd" (this is just the attacker's payloa
 RIGHT recommended_fix: "Reject any fmt value containing path separators or '..' segments before it is joined onto the export directory, and confirm the resolved path stays inside that directory."
 The WRONG answer restates evidence already visible in the log. The RIGHT answer is a code-level instruction that would still make sense even if you deleted the log line above it."""
 
+# Step 8.4 - correlation across a longer time window. defend_live() judges a
+# single log excerpt; a chained/multi-step attack (Step 8.3) only reveals
+# itself across a SEQUENCE - e.g. an attacker enumerates records to disclose a
+# secret in one request, then reuses that secret in a later request. This
+# nudge turns blue's attention to the sequence as a whole and asks it to name
+# the ordered steps when it finds one. Kept separate from the single-excerpt
+# prompt so defend_live()'s behavior is unchanged.
+_CORRELATION_NUDGE = (
+    "\n\nYou are now reviewing not one log line but a CHRONOLOGICAL SEQUENCE of events spanning a longer time window. "
+    "Real attacks often unfold across multiple requests rather than in a single one. Judge the sequence as a whole, and "
+    "look specifically for a MULTI-STEP or CHAINED attack: a value disclosed in an earlier request (a token, id, "
+    "credential, or path) that is then reused as input in a later request to do something that should not be allowed, "
+    "and/or repeated sequential probing (id=1, id=2, id=3, ...) that precedes a privileged action. A later request can be "
+    "an attack precisely because of what an earlier one leaked, even if that later request looks valid on its own. "
+    "In addition to every field below, include two more: \"chained\" (true/false - whether the events form a multi-step "
+    "chain where one step's output enables a later step) and \"attack_chain\" (an ordered list of short plain-language "
+    "strings naming each step of that chain, or [] if there is no chain)."
+    "\n\nWorked example (fictional, illustrative only - not one of the real categories you'll actually see):\n"
+    "Sequence of log events:\n"
+    "  GET /api/profiles/1 -> 200 {\"user\":\"root\",\"api_key\":\"KEY-9x7\"}\n"
+    "  GET /api/profiles/2 -> 200 {\"user\":\"bob\"}\n"
+    "  GET /api/profiles/3 -> 404\n"
+    "  POST /admin/tasks  body={\"api_key\":\"KEY-9x7\"} -> 200 {\"status\":\"ok\"}\n"
+    "Correct reading: the requester walked through profile ids one by one (1,2,3 - enumeration) and the first response "
+    "disclosed root's api_key \"KEY-9x7\"; a LATER request then reused that exact key to call an admin action. Each request "
+    "looks valid alone, but together they are a two-step chain: a disclosure feeding a privileged reuse. The giveaway is a "
+    "value that appears in an early response and then reappears as INPUT in a later request. For this you would answer "
+    "\"chained\": true and \"attack_chain\": [\"enumerated /api/profiles ids and disclosed root's api_key\", \"reused that "
+    "api_key to call POST /admin/tasks as an admin\"]. If no such value-reuse-across-requests exists, answer "
+    "\"chained\": false."
+)
+
+WINDOW_USER_PROMPT_TEMPLATE = (
+    "Analyze this chronological sequence of real web server access-log events, spanning a longer time window, and "
+    "determine whether - taken together - they show an attack, including a multi-step or chained attack where one "
+    "request's disclosure enables a later request:\n\n{log_text}"
+)
+
+# Step 8.4 - deterministic correlation layer. A 3B model recognizes a chained
+# attack only intermittently, but the chain has a hard, mechanical signature in
+# the telemetry itself: an earlier request DISCLOSES a reusable secret (or walks
+# a sequence of ids - enumeration) and a LATER privileged request succeeds using
+# it. This scanner flags that pattern directly off the logs, so chain detection
+# is reliable; the LLM still writes the category/explanation/fix. It only ever
+# UPGRADES a verdict to "chained" when the mechanical pattern is present - it
+# never downgrades, so the model can still catch chains this rule doesn't model.
+_DISCLOSURE_RE = re.compile(r"leaked_token=True|cross_owner=True|reset_token|api_key|secret|credential|private_key", re.I)
+_TAKEOVER_RE = re.compile(r"ADMIN_TAKEOVER|\bTAKEOVER\b|complete[-_]?reset|privilege.?escalat", re.I)
+_FAIL_RE = re.compile(r"REJECT|FAIL|DENIED|UNAUTH|NOT_FOUND|\b401\b|\b403\b|\b404\b", re.I)
+_ID_RE = re.compile(r"\b(?:id|ticket_id|request_id|user_id|object_id)\W{0,3}(\d+)", re.I)
+
+
+def _trim_log_line(line: str) -> str:
+    """Drop a leading 'YYYY-MM-DD HH:MM:SS,mmm ' timestamp and cap length, so a
+    chain step reads cleanly."""
+    line = re.sub(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[,.]\d+\s*", "", line.strip())
+    return line[:110]
+
+
+def _detect_chain_signal(log_text: str) -> dict | None:
+    """Mechanically detect a chained attack in a telemetry window: a disclosure
+    or id-enumeration that PRECEDES a successful privileged/takeover action.
+    Returns {"chained": True, "attack_chain": [...]} or None. Conservative -
+    requires a successful (non-rejected/non-404) privileged action, so a lone
+    enumeration, an isolated failed takeover, or a benign read doesn't trip it."""
+    lines = [l for l in (log_text or "").splitlines() if l.strip()]
+    if len(lines) < 2:
+        return None
+
+    # A successful privileged/takeover action (not a rejected/failed one).
+    takeover_idx = next(
+        (i for i, l in enumerate(lines) if _TAKEOVER_RE.search(l) and not _FAIL_RE.search(l)),
+        None,
+    )
+    if takeover_idx is None:
+        return None
+
+    # A disclosure, or >=3 distinct ids walked (enumeration), somewhere at or
+    # before that privileged action.
+    before = lines[: takeover_idx + 1]
+    disclosure_idx = next((i for i, l in enumerate(before) if _DISCLOSURE_RE.search(l)), None)
+    distinct_ids = {int(m) for l in before for m in _ID_RE.findall(l)}
+    enumerated = len(distinct_ids) >= 3
+
+    if disclosure_idx is None and not enumerated:
+        return None
+
+    first_line = lines[disclosure_idx] if disclosure_idx is not None else next(
+        (l for l in before if _ID_RE.search(l)), before[0]
+    )
+    return {
+        "chained": True,
+        "attack_chain": [
+            f"an earlier request disclosed a reusable secret / enumerated records: {_trim_log_line(first_line)}",
+            f"a later privileged request reused it to escalate: {_trim_log_line(lines[takeover_idx])}",
+        ],
+    }
+
+
 _VALID_SEVERITIES = ("low", "medium", "high", "critical")
 
 SYSTEM_PROMPT = """You are a cybersecurity blue team AI agent responsible for detecting and neutralizing attacks.
@@ -121,12 +221,12 @@ ADAPTER_PATH = str(os.getenv("BLUE_ADAPTER_PATH", _PROJECT_ROOT / "training" / "
 _model_cache: dict = {}
 
 
-def _llm_chat(system: str, user: str) -> tuple[str, float]:
+def _llm_chat(system: str, user: str, deterministic: bool = False) -> tuple[str, float]:
     provider = os.getenv("LLM_PROVIDER", "ollama")
     start = time.time()
 
     if provider == "local":
-        content = _call_local(system, user)
+        content = _call_local(system, user, deterministic=deterministic)
     elif provider == "openai":
         content = _call_openai(system, user)
     elif provider == "huggingface":
@@ -137,7 +237,7 @@ def _llm_chat(system: str, user: str) -> tuple[str, float]:
     return content, round(time.time() - start, 3)
 
 
-def _call_local(system: str, user: str) -> str:
+def _call_local(system: str, user: str, deterministic: bool = False) -> str:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
@@ -191,15 +291,18 @@ def _call_local(system: str, user: str) -> str:
         input_ids = encoded.to(model.device)
 
     import torch
+    # deterministic=True (used by defend_live_window): whether a sequence is a
+    # chained attack is a judgment call that should not flip run-to-run on the
+    # same evidence, so decode greedily. Sampling at 0.7 was making the
+    # `chained` verdict a coin-flip on identical logs (same lesson as the
+    # router's greedy decoding). Single-excerpt defend_live() keeps sampling.
+    gen_kwargs = dict(max_new_tokens=512, pad_token_id=tokenizer.eos_token_id, repetition_penalty=1.1)
+    if deterministic:
+        gen_kwargs["do_sample"] = False
+    else:
+        gen_kwargs.update(temperature=0.7, do_sample=True)
     with torch.inference_mode():
-        output = model.generate(
-            input_ids,
-            max_new_tokens=512,
-            temperature=0.7,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
-            repetition_penalty=1.1,
-        )
+        output = model.generate(input_ids, **gen_kwargs)
 
     new_tokens = output[0][input_ids.shape[1]:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True)
@@ -275,6 +378,23 @@ def _normalize(data: dict) -> dict:
     data["confidence"] = max(0.0, min(1.0, confidence))
     data["explanation"] = str(data.get("explanation") or "").strip()
     data["recommended_fix"] = str(data.get("recommended_fix") or "").strip()
+
+    # Step 8.4 - correlation-window fields, only coerced when present (the
+    # single-excerpt defend_live() never asks for them, so they stay absent
+    # there rather than being injected).
+    if "chained" in data:
+        if isinstance(data["chained"], str):
+            data["chained"] = data["chained"].strip().lower() == "true"
+        else:
+            data["chained"] = bool(data["chained"])
+    if "attack_chain" in data:
+        ac = data["attack_chain"]
+        if isinstance(ac, str):
+            data["attack_chain"] = [s.strip() for s in ac.split(",") if s.strip()]
+        elif isinstance(ac, list):
+            data["attack_chain"] = [str(s).strip() for s in ac if str(s).strip()]
+        else:
+            data["attack_chain"] = []
     return data
 
 
@@ -324,4 +444,42 @@ class BlueTeamAgent:
         )
         result = _parse_json(raw, "unknown")
         result["latency"] = latency
+        return result
+
+    def defend_live_window(self, log_text: str) -> dict:
+        """Step 8.4 - analyze a longer chronological window of events and
+        correlate across them, rather than classifying one excerpt. Returns
+        the same assessment schema as defend_live() plus `chained` (bool) and
+        `attack_chain` (ordered list of step descriptions) when the events
+        form a multi-step chain. Used for chained-attack battles (Step 8.3),
+        where the attack only reveals itself across the sequence."""
+        provider = os.getenv("LLM_PROVIDER", "ollama")
+        if provider in _REMOTE_PROVIDERS:
+            log_text = redact_text(log_text)
+        raw, latency = _llm_chat(
+            SYSTEM_PROMPT + _CORRELATION_NUDGE,
+            WINDOW_USER_PROMPT_TEMPLATE.format(log_text=log_text or "(no new log lines)"),
+            deterministic=True,
+        )
+        result = _parse_json(raw, "unknown")
+        result["latency"] = latency
+        result.setdefault("chained", False)
+        result.setdefault("attack_chain", [])
+
+        # Step 8.4 - fuse the deterministic correlation rule with the model's
+        # verdict. The rule only upgrades to "chained" (never downgrades), so a
+        # chain the model missed is still caught, while a single-step attack the
+        # rule doesn't match keeps the model's (correct) chained=False.
+        model_said_chained = bool(result.get("chained"))
+        signal = _detect_chain_signal(log_text)
+        if signal:
+            result["chained"] = True
+            result["threat_detected"] = True
+            if not result.get("attack_chain"):
+                result["attack_chain"] = signal["attack_chain"]
+            if result.get("severity") in ("", "low", "medium"):
+                result["severity"] = "high"
+            result["chain_detected_by"] = "model+rule" if model_said_chained else "correlation-rule"
+        else:
+            result["chain_detected_by"] = "model" if model_said_chained else "none"
         return result

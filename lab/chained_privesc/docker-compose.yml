@@ -1,0 +1,6 @@
+services:
+  lab-chained-privesc:
+    build: .
+    ports:
+      - "5007:5000"
+    restart: unless-stopped

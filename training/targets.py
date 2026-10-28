@@ -69,6 +69,20 @@ def _build_targets() -> list[LabTarget]:
         targets.append(LabTarget(f"{tech}_express", tech, "express", _EXPRESS_PORTS[tech], True, "train"))
         targets.append(LabTarget(f"{tech}_django", tech, "django", _DJANGO_PORTS[tech], True, "heldout"))
         targets.append(LabTarget(f"{tech}_distractor", tech, "flask", _DISTRACTOR_PORTS[tech], False, "distractor"))
+    # Step 8.3 - chained / multi-step attack target. Only a Flask variant
+    # exists: the plan calls for "at least one chained-attack scenario" to
+    # prove multi-step reasoning, not a full framework matrix, so this is
+    # appended explicitly rather than through the uniform 4-per-technique
+    # scheme above (no express/django/distractor variants yet).
+    #
+    # The chain is router-orchestrated across TWO techniques: token_leak (IDOR
+    # discloses the admin reset_token) then account_takeover (reuse that token
+    # to win). technique_id is set to the terminal step (account_takeover) -
+    # the "what winning this target looks like" label - while the router is
+    # trained to open with token_leak and only pick account_takeover once the
+    # token has been leaked (see agents/red_team/router/build_router_dataset.py's
+    # CHAINED_TARGETS handling).
+    targets.append(LabTarget("chained_privesc", "account_takeover", "flask", 5007, True, "train"))
     return targets
 
 
