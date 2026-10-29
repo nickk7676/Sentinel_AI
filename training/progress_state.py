@@ -46,6 +46,14 @@ _DEFAULT_STATE = {
     # the right denominator for blue's detection rate.
     "total_real_attack_battles": 0,
     "total_real_attack_successes": 0,
+    # Step 9.2 - partial-credit reward sums (graded 0.0-1.0, see
+    # agents/judge/ground_truth.py). red reward is summed over real attack
+    # rounds (its denominator is total_real_attack_battles); blue reward is
+    # summed over every battle (attack + normal), denominator
+    # total_attack_battles + total_normal_battles. Means give a graded "how
+    # close" curve alongside the binary success/detection rates.
+    "total_red_reward": 0.0,
+    "total_blue_reward": 0.0,
 }
 
 

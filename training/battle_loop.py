@@ -57,6 +57,7 @@ from agents.blue_team.agent import SYSTEM_PROMPT as BLUE_SYSTEM
 from agents.blue_team.agent import LIVE_USER_PROMPT_TEMPLATE as BLUE_LIVE_USER_PROMPT_TEMPLATE
 from agents.techniques import DEFAULT_TECHNIQUE_ID, get_technique, list_techniques
 from backend.services.simulation_service import run_simulation
+from training import cost_tracker, curriculum, league
 from training.adapter_version import get_version
 from training.battle_log import log_battle
 from training.dataset import (
@@ -186,20 +187,29 @@ def run_loop(
     max_examples_to_train: int = 200,
     target_url: str | None = None,
     technique: str = DEFAULT_TECHNIQUE_ID,
+    use_curriculum: bool = True,
+    use_league: bool = False,
 ) -> None:
     """target_url: leave as None (default) for Step 5 target diversity - a
     fresh target is picked from training.targets.pick_training_target()
     every battle, randomized across that technique's training-pool targets
     plus an occasional distractor. Pass an explicit URL (--target-url) to
     pin every battle to one fixed target instead, e.g. for debugging a
-    single lab app."""
+    single lab app.
+
+    use_curriculum (Step 9.1): when True and no target is pinned, pick targets
+    by curriculum (easy tiers first, harder ones unlock as the win rate
+    stabilizes) instead of uniform random. use_league (Step 9.3): when True,
+    some rounds pit the current side against an archived past opponent to
+    resist self-play collapse."""
     tech = get_technique(technique)  # fail fast on a typo'd --technique
 
     # Refuses to start if another process is already battling this
     # technique, instead of silently corrupting shared round-numbering and
     # target state (see training/process_lock.py for why this happened).
     with technique_lock(technique):
-        _run_loop_locked(tech, rounds, battles_per_round, min_examples_to_train, max_examples_to_train, target_url, technique)
+        _run_loop_locked(tech, rounds, battles_per_round, min_examples_to_train, max_examples_to_train,
+                         target_url, technique, use_curriculum, use_league)
 
 
 def _reachable_targets(technique_id: str, target_url: str | None) -> tuple[bool, list[str]]:
@@ -328,6 +338,8 @@ def run_loop_all(
     run_eval_snapshots: bool = True,
     eval_attacks_per_technique: int = 2,
     eval_normal_per_technique: int = 1,
+    use_curriculum: bool = True,
+    use_league: bool = False,
 ) -> None:
     """--technique all: runs every registered technique's full rounds x
     battles back-to-back in one process, instead of one `python -m
@@ -396,6 +408,8 @@ def run_loop_all(
                 max_examples_to_train=max_examples_to_train,
                 target_url=target_url,
                 technique=tech.id,
+                use_curriculum=use_curriculum,
+                use_league=use_league,
             )
         except RuntimeError as exc:
             # technique_lock: another process already holds this technique.
@@ -451,6 +465,8 @@ def _run_loop_locked(
     max_examples_to_train: int,
     target_url: str | None,
     technique: str,
+    use_curriculum: bool = True,
+    use_league: bool = False,
 ) -> None:
     print("=" * 60)
     print("  SENTINEL AI — SELF-PLAY TRAINING LOOP")
@@ -461,8 +477,13 @@ def _run_loop_locked(
     print(f"  Max to train:    {max_examples_to_train} (sliding window)")
     if target_url:
         print(f"  Target:          {tech.display_name} vs {target_url} (fixed, --target-url override)")
+    elif use_curriculum:
+        print(f"  Target:          {tech.display_name} vs curriculum-selected targets (Step 9.1, tier "
+              f"{curriculum.unlocked_tier(technique)} unlocked)")
     else:
         print(f"  Target:          {tech.display_name} vs randomized training-pool targets (Step 5)")
+    print(f"  Curriculum:      {'on' if (use_curriculum and not target_url) else 'off'}   "
+          f"League: {'on' if use_league else 'off (snapshots still archived)'}")
     print("=" * 60)
 
     live_writer = _open_writer(TENSORBOARD_LIVE_DIR / technique)
@@ -486,6 +507,8 @@ def _run_loop_locked(
     total_fix_verified = progress["total_fix_verified"]
     total_real_attack_battles = progress["total_real_attack_battles"]
     total_real_attack_successes = progress["total_real_attack_successes"]
+    total_red_reward = progress["total_red_reward"]
+    total_blue_reward = progress["total_blue_reward"]
 
     try:
         for round_num in range(1, rounds + 1):
@@ -533,6 +556,33 @@ def _run_loop_locked(
             red_version = get_version(adapter_path("red", technique))
             blue_version = get_version(adapter_path("blue"))
 
+            # Step 9.2 - per-round partial-reward sums (graded 0.0-1.0).
+            round_red_reward = 0.0
+            round_blue_reward = 0.0
+
+            # Step 9.3 - league matchmaking for this round. Clear any prior
+            # override first, then maybe replace ONE side with an archived past
+            # opponent so the current side trains against an old adversary, not
+            # only itself. Safe on VRAM: inference models are unloaded at every
+            # round boundary (before training), so only one adapter per side is
+            # ever resident within a round.
+            os.environ.pop("RED_ADAPTER_PATH_OVERRIDE", None)
+            os.environ.pop("BLUE_ADAPTER_PATH", None)
+            league_desc = "current vs current"
+            if use_league and not target_url:
+                import random as _rng
+                if _rng.random() < 0.5:
+                    past_red = league.pick_opponent_version(red_version, league.available_versions("red", technique), p_past=1.0)
+                    if past_red is not None:
+                        os.environ["RED_ADAPTER_PATH_OVERRIDE"] = str(league.opponent_adapter_path("red", technique, past_red))
+                        league_desc = f"blue v{blue_version} (current) vs red v{past_red} (past)"
+                else:
+                    past_blue = league.pick_opponent_version(blue_version, league.available_versions("blue", None), p_past=1.0)
+                    if past_blue is not None:
+                        os.environ["BLUE_ADAPTER_PATH"] = str(league.opponent_adapter_path("blue", None, past_blue))
+                        league_desc = f"red v{red_version} (current) vs blue v{past_blue} (past)"
+                print(f"  League matchup: {league_desc}")
+
             for battle_num in range(1, battles_per_round + 1):
                 # Step 5.2: a fresh target is picked every battle (not once
                 # per round) so red/blue never settle into memorizing one
@@ -541,6 +591,10 @@ def _run_loop_locked(
                 if target_url:
                     battle_target_url = target_url
                     picked_target = None
+                elif use_curriculum:
+                    # Step 9.1 - draw from the tiers unlocked so far, easiest first.
+                    picked_target = curriculum.pick_curriculum_target(technique)
+                    battle_target_url = picked_target.url
                 else:
                     picked_target = pick_training_target(technique)
                     battle_target_url = picked_target.url
@@ -578,6 +632,20 @@ def _run_loop_locked(
                     if verdict.get("false_positives"):
                         false_positives += 1
                         total_false_positives += 1
+
+                # Step 9.2 - accumulate graded partial-credit rewards alongside
+                # the binary counters above.
+                round_red_reward += verdict.get("red_reward", 0.0)
+                total_red_reward += verdict.get("red_reward", 0.0)
+                round_blue_reward += verdict.get("blue_reward", 0.0)
+                total_blue_reward += verdict.get("blue_reward", 0.0)
+
+                # Step 9.1 - feed real attack outcomes to the curriculum, which
+                # unlocks harder target tiers once this one is reliably beaten.
+                # Distractor rounds aren't real attacks; normal-traffic rounds
+                # aren't attacks at all - neither counts toward promotion.
+                if use_curriculum and not target_url and was_attack and not is_distractor:
+                    curriculum.record_outcome(technique, bool(verdict.get("attack_success")))
 
                 # Step 7.3: fix verification is a second, independent signal
                 # from detection accuracy - it only ever fires on a battle
@@ -629,6 +697,8 @@ def _run_loop_locked(
                     "total_fix_verified": total_fix_verified,
                     "total_real_attack_battles": total_real_attack_battles,
                     "total_real_attack_successes": total_real_attack_successes,
+                    "total_red_reward": total_red_reward,
+                    "total_blue_reward": total_blue_reward,
                 })
 
                 # Step 4.3 (live): one point per battle, on a running
@@ -716,6 +786,21 @@ def _run_loop_locked(
                   f"False positives {false_positives}/{normal_battles}  |  "
                   f"Fix verified {fix_verified}/{fix_proposed}")
 
+            # Step 9.2 - graded reward means this round (a "how close" signal
+            # the binary rates above can't show). Step 9.4 - record the cost of
+            # this round's battles.
+            battles_done = attack_battles + normal_battles
+            mean_red_reward = round_red_reward / attack_battles if attack_battles else 0.0
+            mean_blue_reward = round_blue_reward / battles_done if battles_done else 0.0
+            tier_note = f"  |  curriculum tier {curriculum.unlocked_tier(technique)}" if (use_curriculum and not target_url) else ""
+            print(f"  Partial reward: red {mean_red_reward:.2f}/attack  |  blue {mean_blue_reward:.2f}/battle{tier_note}")
+            cost_tracker.record("round_battles", technique, round_time, battles=battles_done,
+                                red_reward=round(round_red_reward, 3), blue_reward=round(round_blue_reward, 3))
+            if round_writer is not None:
+                round_writer.add_scalar(f"round/{technique}/mean_red_reward", mean_red_reward, global_round)
+                round_writer.add_scalar(f"round/{technique}/mean_blue_reward", mean_blue_reward, global_round)
+                round_writer.flush()
+
             # Log stats for tracking improvement over time. Keyed on
             # global_round (persisted, never resets) rather than the local
             # round_num, so entries from different process runs never share
@@ -740,7 +825,13 @@ def _run_loop_locked(
                 red_paths = get_data_path("red", technique, max_examples=max_examples_to_train)
                 print(f"\n  Training RED team on {len(red_paths)} most recent "
                       f"{tech.display_name} wins (of {n_red} total)...")
-                _train_safely("red", max_examples_to_train, technique=technique)
+                with cost_tracker.track("red_train", technique, examples=len(red_paths)):
+                    red_trained = _train_safely("red", max_examples_to_train, technique=technique)
+                # Step 9.3 - archive the just-trained checkpoint into the league.
+                if red_trained:
+                    new_red_v = get_version(adapter_path("red", technique))
+                    if league.snapshot("red", technique, new_red_v):
+                        print(f"  League: archived red {technique} v{new_red_v}")
             else:
                 print(f"\n  RED team: only {n_red} {tech.display_name} wins so far "
                       f"(need {min_examples_to_train} to train, skipping)")
@@ -758,11 +849,20 @@ def _run_loop_locked(
                 breakdown_str = ", ".join(f"{t}={c}" for t, c in breakdown.items())
                 print(f"\n  Training BLUE team (shared) on {len(blue_paths)} most recent wins "
                       f"across all techniques (of {n_blue} total, capped per technique): {breakdown_str}")
-                _train_safely("blue", max_examples_to_train, force_include_paths=this_round_blue_win_paths)
+                with cost_tracker.track("blue_train", technique, examples=len(blue_paths)):
+                    blue_trained = _train_safely("blue", max_examples_to_train, force_include_paths=this_round_blue_win_paths)
+                # Step 9.3 - archive the just-trained shared blue checkpoint.
+                if blue_trained:
+                    new_blue_v = get_version(adapter_path("blue"))
+                    if league.snapshot("blue", None, new_blue_v):
+                        print(f"  League: archived blue v{new_blue_v}")
             else:
                 print(f"\n  BLUE team: only {n_blue} wins across all techniques so far "
                       f"(need {min_examples_to_train} to train, skipping)")
     finally:
+        # Step 9.3 - never leave a league adapter override set past the loop.
+        os.environ.pop("RED_ADAPTER_PATH_OVERRIDE", None)
+        os.environ.pop("BLUE_ADAPTER_PATH", None)
         if live_writer is not None:
             live_writer.close()
         if round_writer is not None:
@@ -898,6 +998,14 @@ if __name__ == "__main__":
     parser.add_argument("--eval-normal-per-technique", type=int, default=1,
                         help="--technique all only: normal-traffic battles per target in each before/after "
                              "eval snapshot. Default: 1.")
+    parser.add_argument("--no-curriculum", action="store_true",
+                        help="Step 9.1: disable curriculum target selection (easy tiers first, harder ones "
+                             "unlock as the win rate stabilizes) and go back to uniform random target picks. "
+                             "Ignored when --target-url pins a single target.")
+    parser.add_argument("--league", action="store_true",
+                        help="Step 9.3: enable the checkpoint league - some rounds pit the current side "
+                             "against an archived past opponent to resist self-play collapse. Off by default "
+                             "(it loads an extra adapter). Checkpoint snapshotting happens regardless.")
     args = parser.parse_args()
 
     if args.technique == "all":
@@ -913,6 +1021,8 @@ if __name__ == "__main__":
             run_eval_snapshots=not args.no_eval,
             eval_attacks_per_technique=args.eval_attacks_per_technique,
             eval_normal_per_technique=args.eval_normal_per_technique,
+            use_curriculum=not args.no_curriculum,
+            use_league=args.league,
         )
     else:
         run_loop(
@@ -922,4 +1032,6 @@ if __name__ == "__main__":
             max_examples_to_train=args.max_examples,
             target_url=args.target_url,
             technique=args.technique,
+            use_curriculum=not args.no_curriculum,
+            use_league=args.league,
         )

@@ -29,7 +29,12 @@ def _get_local_model(technique_id: str):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    path = str(adapter_path(technique_id))
+    # Step 9.3 - the checkpoint league points red at a past snapshot for a
+    # battle by setting RED_ADAPTER_PATH_OVERRIDE (mirrors blue's
+    # BLUE_ADAPTER_PATH). Unset in normal self-play -> this technique's own
+    # live adapter.
+    override = os.getenv("RED_ADAPTER_PATH_OVERRIDE")
+    path = override or str(adapter_path(technique_id))
     adapter_exists = os.path.isdir(path) and os.path.exists(
         os.path.join(path, "adapter_config.json")
     )

@@ -241,10 +241,15 @@ def _call_local(system: str, user: str, deterministic: bool = False) -> str:
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    adapter_exists = os.path.isdir(ADAPTER_PATH) and os.path.exists(
-        os.path.join(ADAPTER_PATH, "adapter_config.json")
+    # Resolve the adapter path per call (not once at import) so the Step 9.3
+    # league can point blue at a past snapshot for a round by setting
+    # BLUE_ADAPTER_PATH, then clear it - without this being read fresh each
+    # time, an env change mid-process would never take effect.
+    adapter_dir = os.getenv("BLUE_ADAPTER_PATH") or ADAPTER_PATH
+    adapter_exists = os.path.isdir(adapter_dir) and os.path.exists(
+        os.path.join(adapter_dir, "adapter_config.json")
     )
-    cache_key = ADAPTER_PATH if adapter_exists else "base"
+    cache_key = adapter_dir if adapter_exists else "base"
 
     if cache_key not in _model_cache:
         base_model = os.getenv("BASE_MODEL", "Qwen/Qwen2.5-3B-Instruct")
@@ -267,7 +272,7 @@ def _call_local(system: str, user: str, deterministic: bool = False) -> str:
 
         if adapter_exists:
             from peft import PeftModel
-            model = PeftModel.from_pretrained(model, ADAPTER_PATH)
+            model = PeftModel.from_pretrained(model, adapter_dir)
 
         model.eval()
         _model_cache[cache_key] = (model, tokenizer)
