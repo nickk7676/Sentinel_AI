@@ -131,5 +131,6 @@ IDOR = register(Technique(
                   # still name owner-vs-requester authorization - a generic
                   # "validate input" would match none of them.
                   "owner to the requester", "object's owner", "owner matches", "authorization check", "authorized to access",
-                  "owner id", "object owner", "against the owner", "owner against", "to the owner"),
+                  "owner id", "object owner", "against the owner", "owner against", "to the owner",
+                  "owners", "ownership", "resource's owner", "owned", "account's own"),
 ))
