@@ -786,23 +786,32 @@ def _run_loop_locked(
                 if verdict.get("detection_correct"):
                     log_excerpt = defense.pop("_log_excerpt", "")
                     blue_user_prompt = BLUE_LIVE_USER_PROMPT_TEMPLATE.format(log_text=log_excerpt or "(no new log lines)")
-                    saved_path = save_blue_win(attack, defense, BLUE_SYSTEM, blue_user_prompt, example_technique)
-                    this_round_blue_win_paths.append(saved_path)
 
-                    # Step 7.3: fix verification is a second reward signal,
-                    # separate from detection accuracy. Training here is SFT
-                    # on saved winning examples, not RL with a scalar reward,
-                    # so the signal is realized as oversampling: a battle
-                    # where blue both detected the attack AND proposed a fix
-                    # verified (via a real replay against the patched
-                    # distractor target) to actually close the hole gets
-                    # this exact example saved a second time, so it's
-                    # naturally overrepresented in blue's training batch
-                    # relative to a detection-only win with an unverified or
-                    # wrong fix - without changing detection's own gate above
-                    # or touching training/dataset.py's selection logic.
-                    if remediation.get("fix_verified"):
-                        extra_path = save_blue_win(attack, defense, BLUE_SYSTEM, blue_user_prompt, example_technique)
+                    # Detection and remediation are separate skills, so they
+                    # get separate gates. Detection correctness (the outer if)
+                    # is what makes this a blue win and is ALWAYS trained on.
+                    # The recommended_fix rides along in the same defense
+                    # payload, but blue should never learn to reproduce an
+                    # unverified or wrong fix just because the detection was
+                    # right (that's how blacklist-style SQLi fixes leaked into
+                    # the pool). So the fix fields are kept only when the fix
+                    # actually verified - replayed against the patched target
+                    # and confirmed to close the hole - and stripped
+                    # otherwise, leaving a detection-only training example.
+                    # Step 7.3: a verified fix is additionally saved a SECOND
+                    # time (oversampling via training/dataset.py's
+                    # always_include), so good fixes are over-represented in
+                    # blue's batch rather than merely allowed in.
+                    fix_verified = bool(remediation.get("fix_verified"))
+                    defense_for_training = dict(defense)
+                    if not fix_verified:
+                        for _k in ("recommended_fix", "mitigation", "recommendations"):
+                            defense_for_training.pop(_k, None)
+
+                    saved_path = save_blue_win(attack, defense_for_training, BLUE_SYSTEM, blue_user_prompt, example_technique)
+                    this_round_blue_win_paths.append(saved_path)
+                    if fix_verified:
+                        extra_path = save_blue_win(attack, defense_for_training, BLUE_SYSTEM, blue_user_prompt, example_technique)
                         this_round_blue_win_paths.append(extra_path)
 
                 quality = verdict.get("defense_quality", 0)
