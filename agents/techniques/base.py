@@ -53,6 +53,17 @@ class Technique:
     # react to real HTTP responses, independent of how well-trained it is.
     max_turns: int = 5
 
+    # A chain step (Step 8.3) is one half of a router-orchestrated chained
+    # attack (token_leak -> account_takeover): it depends on an artifact the
+    # previous step hands it via chain_context, so it can NEVER win when run
+    # standalone (account_takeover scores 0 with no token to replay). The
+    # self-play training sweep (run_loop_all / --technique all) skips these -
+    # they'd only generate 0% noise and no training wins - while the router
+    # chain path (agents/red_team/router/battle_runner.py) still exercises
+    # them in sequence. Explicit single runs (--technique account_takeover)
+    # are still allowed.
+    chain_step: bool = False
+
     # Blue/judge side
     category_keywords: tuple[str, ...] = ()
     # Step 7.1/7.2 - keywords that, if present in blue's freeform

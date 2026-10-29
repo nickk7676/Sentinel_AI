@@ -82,16 +82,26 @@ TENSORBOARD_TRAIN_DIR = DATA_DIR / "tensorboard" / "rounds"
 TENSORBOARD_LIVE_DIR = DATA_DIR / "tensorboard" / "live"
 
 
+def _run_stamp() -> str:
+    """A per-run id (local date-time) used as the leaf TensorBoard directory
+    for a run, e.g. live/idor/20261028_173005. Each training session gets its
+    own leaf, so TensorBoard lists every session as a separate, toggleable run
+    instead of merging every session's event file in one directory into a
+    single overlapping line. Shared across a technique's live + round writers
+    (and across all techniques in one --technique all session) so one session
+    groups together."""
+    from datetime import datetime
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
 def _open_writer(log_dir):
     """A persistent writer, opened once per run_loop() call and closed once
-    at the end (not once per round/battle) - both to avoid fragmenting
-    TensorBoard's log directory into dozens of tiny event files, and because
-    step numbers are now sourced from training/progress_state.py's
-    persisted, ever-increasing counters instead of local variables that used
-    to reset to zero every time the process restarted (that reset was what
-    caused overlapping/wonky lines: a new process's fresh round 1 / battle 1
-    would land right on top of a previous session's already-plotted range in
-    the same run)."""
+    at the end (not once per round/battle). log_dir ends in a per-run stamp
+    (see _run_stamp), so a run writes exactly one event file into its own
+    directory - TensorBoard then shows each run as its own line rather than
+    stacking every past session's file on top of each other. Step numbers
+    still come from training/progress_state.py's persisted, ever-increasing
+    counters, so the x-axis stays continuous within a run."""
     try:
         from torch.utils.tensorboard import SummaryWriter
     except ImportError:
@@ -189,6 +199,7 @@ def run_loop(
     technique: str = DEFAULT_TECHNIQUE_ID,
     use_curriculum: bool = True,
     use_league: bool = False,
+    run_id: str | None = None,
 ) -> None:
     """target_url: leave as None (default) for Step 5 target diversity - a
     fresh target is picked from training.targets.pick_training_target()
@@ -203,13 +214,14 @@ def run_loop(
     some rounds pit the current side against an archived past opponent to
     resist self-play collapse."""
     tech = get_technique(technique)  # fail fast on a typo'd --technique
+    run_id = run_id or _run_stamp()
 
     # Refuses to start if another process is already battling this
     # technique, instead of silently corrupting shared round-numbering and
     # target state (see training/process_lock.py for why this happened).
     with technique_lock(technique):
         _run_loop_locked(tech, rounds, battles_per_round, min_examples_to_train, max_examples_to_train,
-                         target_url, technique, use_curriculum, use_league)
+                         target_url, technique, use_curriculum, use_league, run_id)
 
 
 def _reachable_targets(technique_id: str, target_url: str | None) -> tuple[bool, list[str]]:
@@ -360,9 +372,22 @@ def run_loop_all(
     stay meaningful next to any manual eval_harness runs in the same
     eval_summary.jsonl / TensorBoard history, instead of colliding with
     round 0 or injecting a raw timestamp into that series."""
-    techniques = list_techniques()
+    # Chain steps (token_leak, account_takeover) can't win standalone - they
+    # need an artifact the previous step hands them via the router chain - so
+    # the self-play sweep skips them (they'd only log 0% noise and no training
+    # wins). They're still exercised in sequence by the router battle-runner.
+    skipped_chain = [t.id for t in list_techniques() if getattr(t, "chain_step", False)]
+    techniques = [t for t in list_techniques() if not getattr(t, "chain_step", False)]
     total = len(techniques)
     overall_start = time.time()
+    if skipped_chain:
+        print(f"  (skipping chain-step techniques {skipped_chain} - trained via the router chain path, "
+              f"not the standalone sweep)")
+    # One shared stamp for the whole session, so every technique's live/round
+    # writers land under the same run leaf (e.g. live/idor/<stamp>,
+    # live/ssrf/<stamp>) and TensorBoard groups the session as one selectable
+    # run across techniques instead of scattering it.
+    run_id = _run_stamp()
 
     print("#" * 60)
     print(f"  SENTINEL AI — ALL-TECHNIQUES OVERNIGHT RUN ({total} techniques)")
@@ -410,6 +435,7 @@ def run_loop_all(
                 technique=tech.id,
                 use_curriculum=use_curriculum,
                 use_league=use_league,
+                run_id=run_id,
             )
         except RuntimeError as exc:
             # technique_lock: another process already holds this technique.
@@ -467,7 +493,9 @@ def _run_loop_locked(
     technique: str,
     use_curriculum: bool = True,
     use_league: bool = False,
+    run_id: str | None = None,
 ) -> None:
+    run_id = run_id or _run_stamp()
     print("=" * 60)
     print("  SENTINEL AI — SELF-PLAY TRAINING LOOP")
     print("=" * 60)
@@ -486,8 +514,8 @@ def _run_loop_locked(
           f"League: {'on' if use_league else 'off (snapshots still archived)'}")
     print("=" * 60)
 
-    live_writer = _open_writer(TENSORBOARD_LIVE_DIR / technique)
-    round_writer = _open_writer(TENSORBOARD_TRAIN_DIR / technique)
+    live_writer = _open_writer(TENSORBOARD_LIVE_DIR / technique / run_id)
+    round_writer = _open_writer(TENSORBOARD_TRAIN_DIR / technique / run_id)
 
     # Cumulative counts and the round number itself are both persisted to
     # disk (training/progress_state.py) and loaded here rather than starting
@@ -706,6 +734,13 @@ def _run_loop_locked(
                 # curve is visible while a round is still in progress
                 # instead of only appearing once the round completes.
                 if live_writer is not None:
+                    # Per-technique live (intra-run) curves. The technique is
+                    # kept in the tag ("live/<technique>/...") so each
+                    # technique gets its OWN chart in TensorBoard instead of
+                    # every technique's line piling onto one shared chart. Red
+                    # attack success and blue detection both appear here (the
+                    # live view); their round-summary counterparts are in the
+                    # rounds writer (the rounds view).
                     if total_real_attack_battles:
                         live_writer.add_scalar(
                             f"live/{technique}/cumulative_red_attack_success_rate",
@@ -958,12 +993,11 @@ def _log_tensorboard_round(writer, technique, global_round, attack_battles, atta
     signal, tracked independently from detection the same way false positives
     already are.
 
-    Takes an already-open writer (opened once per run_loop() call) rather
-    than opening its own per round - both to stop fragmenting the log
-    directory into one tiny event file per round, and because global_round
-    is now a persisted, ever-increasing number (training/progress_state.py),
-    so points from different process runs extend the same line instead of
-    overlapping it."""
+    Takes an already-open writer (opened once per run_loop() call, into this
+    run's own dated directory so sessions don't overlap). The technique is
+    kept in each tag ("rounds/<technique>/...") so every technique gets its
+    OWN chart - red's attack success rate and blue's detection rate both in
+    the rounds view, mirroring the live writer's per-technique live view."""
     if real_attack_battles:
         writer.add_scalar(f"rounds/{technique}/red_attack_success_rate", real_attack_successes / real_attack_battles, global_round)
     if attack_battles:

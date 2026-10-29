@@ -105,6 +105,7 @@ ACCOUNT_TAKEOVER = register(Technique(
     describe_attempt=_describe_attempt,
     perform_normal_action=_perform_normal_action,
     max_turns=3,
+    chain_step=True,  # STEP B of the chain - skipped by the standalone training sweep (see base.Technique.chain_step)
     category_keywords=("account takeover", "privilege escalation", "stolen token", "token reuse",
                        "password reset abuse", "reset token"),
     fix_keywords=("unguessable reset token", "random reset token", "single-use", "one-time token",

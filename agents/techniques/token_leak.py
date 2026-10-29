@@ -113,6 +113,7 @@ TOKEN_LEAK = register(Technique(
     describe_attempt=_describe_attempt,
     perform_normal_action=_perform_normal_action,
     max_turns=6,
+    chain_step=True,  # STEP A of the chain - skipped by the standalone training sweep (see base.Technique.chain_step)
     category_keywords=("reset token disclosure", "password reset", "idor", "insecure direct object reference",
                        "sensitive data exposure", "token leak", "broken object level authorization"),
     fix_keywords=("authorization check", "object-level authorization", "do not expose reset tokens",

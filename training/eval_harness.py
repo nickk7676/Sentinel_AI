@@ -353,7 +353,14 @@ def _log_tensorboard(round_num: int, per_technique: dict, overall: dict) -> None
         print("  (tensorboard not installed - skipping scalar logging; `pip install tensorboard`)")
         return
 
-    writer = SummaryWriter(log_dir=str(TENSORBOARD_EVAL_DIR))
+    # Each eval pass writes into its own dated leaf (eval/<stamp>), so
+    # TensorBoard lists every eval as its own selectable run instead of
+    # merging every past pass's event file into one overlapping line. Tags
+    # keep the original "eval/..." structure (tech id included) so every
+    # technique keeps its own chart.
+    from datetime import datetime
+    run_dir = TENSORBOARD_EVAL_DIR / datetime.now().strftime("%Y%m%d_%H%M%S")
+    writer = SummaryWriter(log_dir=str(run_dir))
     for metric, value in overall.items():
         if isinstance(value, (int, float)):
             writer.add_scalar(f"eval/overall/{metric}", value, round_num)
