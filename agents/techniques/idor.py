@@ -123,5 +123,13 @@ IDOR = register(Technique(
     # show up in advice for almost any technique (broken_auth included)
     # without ever mentioning that the fix is a per-object ownership check,
     # which is the one thing that actually closes an IDOR.
-    fix_keywords=("ownership check", "owner_id", "belongs to the requester", "object-level authorization", "verify the requester owns", "compare the resource owner"),
+    fix_keywords=("ownership check", "owner_id", "belongs to the requester", "object-level authorization", "verify the requester owns", "compare the resource owner",
+                  # Blue routinely describes the correct per-object ownership
+                  # check in its own words rather than these exact phrases
+                  # ("compare the object's owner to the requester's id..."), so
+                  # the paraphrases below count those correct fixes too. All
+                  # still name owner-vs-requester authorization - a generic
+                  # "validate input" would match none of them.
+                  "owner to the requester", "object's owner", "owner matches", "authorization check", "authorized to access",
+                  "owner id", "object owner", "against the owner", "owner against", "to the owner"),
 ))

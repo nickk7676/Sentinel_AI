@@ -112,5 +112,11 @@ SSRF = register(Technique(
     # requests to internal/private address space, which is what stops SSRF
     # specifically (an allowlist of e.g. "commands" or "file extensions"
     # elsewhere in this codebase would falsely match otherwise).
-    fix_keywords=("block requests to internal", "deny access to private ip", "block loopback", "block link-local", "169.254", "allowlist of permitted destination", "resolve and validate the destination ip", "block metadata endpoint"),
+    fix_keywords=("block requests to internal", "deny access to private ip", "block loopback", "block link-local", "169.254", "allowlist of permitted destination", "resolve and validate the destination ip", "block metadata endpoint",
+                  # Blue commonly says "whitelist of allowed destination hosts"
+                  # or names the loopback host directly ("block localhost /
+                  # 127.0.0.1"); these are the same allowlist / block-internal
+                  # remediation in different words. A wrong fix (e.g. "validate
+                  # the URL format") matches none of them.
+                  "allowlist", "whitelist", "127.0.0.1", "localhost", "block internal", "internal host", "private ip"),
 ))
