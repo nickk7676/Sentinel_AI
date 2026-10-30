@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Link preview · Institute Admissions Portal (fake)</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  {% include "_header.html" %}
+  <main>
+    <div class="card">
+      <h2>Preview an application link</h2>
+      <p class="kv" style="font-family:system-ui,sans-serif;font-size:13px;">
+        Paste a link from your application (e.g. a portfolio or transcript URL) and we'll fetch a preview for the committee.
+      </p>
+      <label for="url">Link URL</label>
+      <input type="text" id="url" placeholder="https://example.com/my-portfolio">
+      <button id="previewBtn" type="button">Preview link</button>
+      <div id="result" class="result" style="display:none;"></div>
+    </div>
+    <div class="foot">Fictional security demo. Not affiliated with, endorsed by, or representative of MIT.</div>
+  </main>
+  <script>
+    const btn = document.getElementById('previewBtn');
+    const result = document.getElementById('result');
+    btn.addEventListener('click', async () => {
+      const url = document.getElementById('url').value;
+      result.style.display = 'block';
+      result.className = 'result';
+      result.textContent = 'Fetching preview of ' + url + '…';
+      try {
+        const resp = await fetch('/preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url })
+        });
+        const d = await resp.json();
+        const leaked = (d.content || '').includes('SENTINELAI-SSRF-CANARY');
+        result.className = leaked ? 'result leaked' : 'result';
+        let head = leaked ? '⚠ FETCHED AN INTERNAL-ONLY ADMIN SERVICE (server-side request forgery)\n\n' : '';
+        result.textContent = head + JSON.stringify(d, null, 2);
+      } catch (e) { result.textContent = 'Error: ' + e; }
+    });
+  </script>
+</body>
+</html>

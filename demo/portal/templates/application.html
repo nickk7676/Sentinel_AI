@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Application case · Institute Admissions Portal (fake)</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  {% include "_header.html" %}
+  <main>
+    <div class="card">
+      <h2>View application case</h2>
+      <p class="kv" style="font-family:system-ui,sans-serif;font-size:13px;">Enter your application case number to view its details.</p>
+      <label for="caseId">Case number</label>
+      <input type="number" id="caseId" value="1">
+      <button id="viewBtn" type="button">View case</button>
+      <div id="result" class="result" style="display:none;"></div>
+    </div>
+    <div class="foot">Fictional security demo. Not affiliated with, endorsed by, or representative of MIT.</div>
+  </main>
+  <script>
+    const btn = document.getElementById('viewBtn');
+    const result = document.getElementById('result');
+    async function viewCase() {
+      const id = document.getElementById('caseId').value;
+      const token = sessionStorage.getItem('session_token') || '';
+      result.style.display = 'block';
+      result.className = 'result';
+      result.textContent = 'Loading case #' + id + '…';
+      try {
+        const resp = await fetch('/api/tickets/' + encodeURIComponent(id), {
+          headers: { 'Authorization': 'Bearer ' + token }
+        });
+        const d = await resp.json();
+        const leaked = JSON.stringify(d).includes('SENTINELAI-IDOR-CANARY')
+                       || (d.confidential_notes !== undefined);
+        result.className = leaked ? 'result leaked' : 'result';
+        let head = '';
+        if (leaked) head = '⚠ EXPOSED ANOTHER APPLICANT\'S CONFIDENTIAL CASE (no ownership check)\n\n';
+        result.textContent = head + JSON.stringify(d, null, 2);
+      } catch (e) { result.textContent = 'Error: ' + e; }
+    }
+    btn.addEventListener('click', viewCase);
+  </script>
+</body>
+</html>

