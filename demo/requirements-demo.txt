@@ -1,0 +1,8 @@
+# Extra dependencies for the demo (install into the project venv311, which
+# already has torch/transformers/peft for the agents):
+#   venv311/Scripts/python.exe -m pip install -r demo/requirements-demo.txt
+#   venv311/Scripts/python.exe -m playwright install chromium
+flask>=3.0
+playwright>=1.40
+colorama>=0.4            # optional: nicer ANSI colors on Windows terminals
+requests>=2.28           # already present (agents use it) — listed for completeness

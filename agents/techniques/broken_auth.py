@@ -120,4 +120,9 @@ BROKEN_AUTH = register(Technique(
     describe_attempt=_describe_attempt,
     perform_normal_action=_perform_normal_login,
     category_keywords=("broken authentication", "predictable session", "session hijack", "session prediction", "session fixation"),
+    # Excludes bare "random"/"unpredictable"/"cryptographic" - each is common
+    # enough in generic security filler ("add random delays", "use crypto
+    # best practices") to match without ever confirming the fix is actually
+    # a non-sequential, unguessable session identifier.
+    fix_keywords=("cryptographically random", "secrets.token", "non-sequential", "uuid4", "unpredictable token", "not sequential", "sufficient entropy"),
 ))

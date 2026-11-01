@@ -53,8 +53,28 @@ class Technique:
     # react to real HTTP responses, independent of how well-trained it is.
     max_turns: int = 5
 
+    # A chain step (Step 8.3) is one half of a router-orchestrated chained
+    # attack (token_leak -> account_takeover): it depends on an artifact the
+    # previous step hands it via chain_context, so it can NEVER win when run
+    # standalone (account_takeover scores 0 with no token to replay). The
+    # self-play training sweep (run_loop_all / --technique all) skips these -
+    # they'd only generate 0% noise and no training wins - while the router
+    # chain path (agents/red_team/router/battle_runner.py) still exercises
+    # them in sequence. Explicit single runs (--technique account_takeover)
+    # are still allowed.
+    chain_step: bool = False
+
     # Blue/judge side
     category_keywords: tuple[str, ...] = ()
+    # Step 7.1/7.2 - keywords that, if present in blue's freeform
+    # recommended_fix text, indicate it named the actual correct remediation
+    # category for this technique (same substring-match pattern as
+    # category_keywords, just applied to the fix field instead of the
+    # threat_category field). Used by agents/judge/verification.py to decide
+    # whether blue's proposed fix is even worth verifying against a real
+    # patched target, since there's no code-patching engine that turns
+    # arbitrary fix prose into an applicable diff.
+    fix_keywords: tuple[str, ...] = ()
 
     # Telemetry (2.2) - override only if a target doesn't expose the generic /logs shape
     fetch_telemetry: TelemetryFetcher = fetch_new_logs

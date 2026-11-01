@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Account recovery · Institute Admissions Portal (fake)</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  {% include "_header.html" %}
+  <main>
+    <div class="card">
+      <h2>Look up a password-reset request</h2>
+      <p class="kv" style="font-family:system-ui,sans-serif;font-size:13px;">Check the status of a pending reset request by its number.</p>
+      <label for="reqId">Reset request number</label>
+      <input type="number" id="reqId" value="3">
+      <button id="lookupBtn" type="button">Look up</button>
+      <div id="lookupResult" class="result" style="display:none;"></div>
+    </div>
+
+    <div class="card">
+      <h2>Complete a password reset</h2>
+      <label for="token">Reset token</label>
+      <input type="text" id="token" placeholder="RST-…">
+      <button id="completeBtn" type="button">Complete reset</button>
+      <div id="completeResult" class="result" style="display:none;"></div>
+    </div>
+    <div class="foot">Fictional security demo. Not affiliated with, endorsed by, or representative of MIT.</div>
+  </main>
+  <script>
+    const lookupResult = document.getElementById('lookupResult');
+    document.getElementById('lookupBtn').addEventListener('click', async () => {
+      const id = document.getElementById('reqId').value;
+      lookupResult.style.display = 'block';
+      lookupResult.className = 'result';
+      lookupResult.textContent = 'Looking up request #' + id + '…';
+      try {
+        const resp = await fetch('/api/reset-requests/' + encodeURIComponent(id));
+        const d = await resp.json();
+        const leaked = d.reset_token !== undefined;
+        lookupResult.className = leaked ? 'result leaked' : 'result';
+        let head = leaked ? '⚠ LEAKED ANOTHER USER\'S ONE-TIME RESET TOKEN (no authorization check)\n\n' : '';
+        lookupResult.textContent = head + JSON.stringify(d, null, 2);
+        if (leaked) document.getElementById('token').value = d.reset_token;
+      } catch (e) { lookupResult.textContent = 'Error: ' + e; }
+    });
+
+    const completeResult = document.getElementById('completeResult');
+    document.getElementById('completeBtn').addEventListener('click', async () => {
+      const token = document.getElementById('token').value;
+      completeResult.style.display = 'block';
+      completeResult.className = 'result';
+      completeResult.textContent = 'Submitting reset…';
+      try {
+        const resp = await fetch('/account/complete-reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reset_token: token })
+        });
+        const d = await resp.json();
+        const owned = JSON.stringify(d).includes('SENTINELAI-CHAIN-CANARY') || d.status === 'success';
+        completeResult.className = owned ? 'result leaked' : 'result';
+        let head = owned ? '⚠ ADMIN ACCOUNT TAKEN OVER WITH THE STOLEN TOKEN\n\n' : '';
+        completeResult.textContent = head + JSON.stringify(d, null, 2);
+      } catch (e) { completeResult.textContent = 'Error: ' + e; }
+    });
+  </script>
+</body>
+</html>

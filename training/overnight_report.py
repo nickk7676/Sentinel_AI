@@ -134,9 +134,15 @@ def write_summary(
         id, display_name, status, elapsed_seconds,
         attack_battles, attack_successes, detections,
         normal_battles, false_positives,
+        real_attack_battles, real_attack_successes,
         red_attack_success_rate, blue_detection_rate, blue_false_positive_rate
       (the three rates are None for a technique that never ran a battle -
       skipped or crashed before its first result came back).
+      real_attack_battles/real_attack_successes exclude distractor-target
+      battles (Step 5.3) - red_attack_success_rate is computed from these,
+      not from attack_battles/attack_successes, since a distractor target is
+      deliberately unexploitable and would otherwise structurally cap red's
+      reported success rate below 100% regardless of its actual skill.
 
     baseline_eval/after_eval: raw dicts returned by
     eval_harness.run_eval(), taken right before and right after this run's
@@ -154,11 +160,20 @@ def write_summary(
     total_detections = sum(s["detections"] for s in session_stats)
     total_normal_battles = sum(s["normal_battles"] for s in session_stats)
     total_false_positives = sum(s["false_positives"] for s in session_stats)
+    total_fix_proposed = sum(s.get("fix_proposed", 0) for s in session_stats)
+    total_fix_verified = sum(s.get("fix_verified", 0) for s in session_stats)
+    total_real_attack_battles = sum(s.get("real_attack_battles", 0) for s in session_stats)
+    total_real_attack_successes = sum(s.get("real_attack_successes", 0) for s in session_stats)
     total_battles = total_attack_battles + total_normal_battles
 
-    overall_success = total_attack_successes / total_attack_battles if total_attack_battles else None
+    # Step 5.3 - excludes distractor-target battles (deliberately
+    # unexploitable) from red's own success rate; blue's detection rate
+    # correctly keeps them, since detecting them is exactly what the
+    # distractor is there to measure.
+    overall_success = total_real_attack_successes / total_real_attack_battles if total_real_attack_battles else None
     overall_detect = total_detections / total_attack_battles if total_attack_battles else None
     overall_fp = total_false_positives / total_normal_battles if total_normal_battles else None
+    overall_fix_verified = total_fix_verified / total_fix_proposed if total_fix_proposed else None
 
     stat_tiles = "".join([
         _stat_tile(f"{n_complete}/{n_total}", "Techniques completed"),
@@ -166,12 +181,14 @@ def write_summary(
         _stat_tile(_fmt_pct(overall_success), "Red attack success"),
         _stat_tile(_fmt_pct(overall_detect), "Blue detection rate"),
         _stat_tile(_fmt_pct(overall_fp), "Blue false-positive rate"),
+        _stat_tile(_fmt_pct(overall_fix_verified), "Blue fix-verified rate"),
         _stat_tile(f"{overall_elapsed / 3600:.1f}h", "Total run time"),
     ])
 
     red_bars = "".join(
         _bar_row(s["display_name"], s["red_attack_success_rate"],
-                 f"{s['attack_successes']}/{s['attack_battles']} attacks succeeded" if s["attack_battles"] else "no attack battles ran")
+                 f"{s.get('real_attack_successes', 0)}/{s.get('real_attack_battles', 0)} attacks succeeded"
+                 f" (excl. distractor rounds)" if s.get("real_attack_battles") else "no attack battles ran")
         for s in session_stats
     )
     detect_bars = "".join(
@@ -184,17 +201,24 @@ def write_summary(
                  f"{s['false_positives']}/{s['normal_battles']} normal battles flagged" if s["normal_battles"] else "no normal-traffic battles ran")
         for s in session_stats
     )
+    fix_bars = "".join(
+        _bar_row(s["display_name"], s.get("blue_fix_verified_rate"),
+                 f"{s.get('fix_verified', 0)}/{s.get('fix_proposed', 0)} proposed fixes verified to close the hole"
+                 if s.get("fix_proposed") else "no verifiable fixes proposed")
+        for s in session_stats
+    )
 
     table_rows = "".join(f"""
         <tr>
           <td>{html.escape(s["display_name"])}</td>
           <td>{_status_badge(s["status"])}</td>
           <td>{round(s["elapsed_seconds"])}s</td>
-          <td>{s["attack_battles"]}</td>
+          <td>{s.get("real_attack_battles", 0)}</td>
           <td>{s["normal_battles"]}</td>
           <td>{_fmt_pct(s["red_attack_success_rate"])}</td>
           <td>{_fmt_pct(s["blue_detection_rate"])}</td>
           <td>{_fmt_pct(s["blue_false_positive_rate"])}</td>
+          <td>{_fmt_pct(s.get("blue_fix_verified_rate"))}</td>
         </tr>""" for s in session_stats)
 
     before_all = _eval_scope_rates(baseline_eval, None)
@@ -323,11 +347,16 @@ def write_summary(
   </div>
 
   <div class="card">
+    <h2>Blue — fix-verified rate (Step 7: proposed fixes confirmed to close the hole)</h2>
+    {fix_bars}
+  </div>
+
+  <div class="card">
     <h2>Per-technique detail</h2>
     <table>
       <thead>
-        <tr><th>Technique</th><th>Status</th><th>Elapsed</th><th>Attacks</th><th>Normal</th>
-            <th>Red success</th><th>Blue detect</th><th>Blue FP</th></tr>
+        <tr><th>Technique</th><th>Status</th><th>Elapsed</th><th>Attacks (excl. distractor)</th><th>Normal</th>
+            <th>Red success</th><th>Blue detect</th><th>Blue FP</th><th>Blue fix verified</th></tr>
       </thead>
       <tbody>{table_rows}</tbody>
     </table>

@@ -57,6 +57,7 @@ from agents.blue_team.agent import SYSTEM_PROMPT as BLUE_SYSTEM
 from agents.blue_team.agent import LIVE_USER_PROMPT_TEMPLATE as BLUE_LIVE_USER_PROMPT_TEMPLATE
 from agents.techniques import DEFAULT_TECHNIQUE_ID, get_technique, list_techniques
 from backend.services.simulation_service import run_simulation
+from training import cost_tracker, curriculum, league
 from training.adapter_version import get_version
 from training.battle_log import log_battle
 from training.dataset import (
@@ -81,16 +82,26 @@ TENSORBOARD_TRAIN_DIR = DATA_DIR / "tensorboard" / "rounds"
 TENSORBOARD_LIVE_DIR = DATA_DIR / "tensorboard" / "live"
 
 
+def _run_stamp() -> str:
+    """A per-run id (local date-time) used as the leaf TensorBoard directory
+    for a run, e.g. live/idor/20261028_173005. Each training session gets its
+    own leaf, so TensorBoard lists every session as a separate, toggleable run
+    instead of merging every session's event file in one directory into a
+    single overlapping line. Shared across a technique's live + round writers
+    (and across all techniques in one --technique all session) so one session
+    groups together."""
+    from datetime import datetime
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
 def _open_writer(log_dir):
     """A persistent writer, opened once per run_loop() call and closed once
-    at the end (not once per round/battle) - both to avoid fragmenting
-    TensorBoard's log directory into dozens of tiny event files, and because
-    step numbers are now sourced from training/progress_state.py's
-    persisted, ever-increasing counters instead of local variables that used
-    to reset to zero every time the process restarted (that reset was what
-    caused overlapping/wonky lines: a new process's fresh round 1 / battle 1
-    would land right on top of a previous session's already-plotted range in
-    the same run)."""
+    at the end (not once per round/battle). log_dir ends in a per-run stamp
+    (see _run_stamp), so a run writes exactly one event file into its own
+    directory - TensorBoard then shows each run as its own line rather than
+    stacking every past session's file on top of each other. Step numbers
+    still come from training/progress_state.py's persisted, ever-increasing
+    counters, so the x-axis stays continuous within a run."""
     try:
         from torch.utils.tensorboard import SummaryWriter
     except ImportError:
@@ -137,21 +148,46 @@ def _train_in_subprocess(
             force_include_file.unlink(missing_ok=True)
 
 
+# A training subprocess crashing with STATUS_ACCESS_VIOLATION (3221225477 /
+# 0xC0000005) has been observed on Windows specifically when this parent
+# process already loaded+used its own quantized model for live battles just
+# before spawning the training subprocess - reproduced in isolation with a
+# minimal script containing none of this codebase's logic, so it's a
+# Windows/driver/CUDA-multi-process issue, not something fixable here. A
+# short delay + retry costs nothing (training crashes already skip cleanly -
+# see the docstring below) and gives the driver more time to fully release
+# the parent's GPU state between attempts.
+_TRAIN_CRASH_RETRIES = 2
+_TRAIN_CRASH_RETRY_DELAY_SECONDS = 8
+
+
 def _train_safely(agent: str, max_examples: int, technique: str | None = None, force_include_paths: list[str] | None = None) -> bool:
     """Wraps _train_in_subprocess so a training crash (GPU contention with
     another process, a driver-level crash, OOM, etc.) costs this round's
     training and nothing else - without this, an unhandled
     CalledProcessError propagates out of run_loop() and kills the entire
     multi-round run, including every round after the one that happened to
-    crash. Returns whether training actually completed."""
-    try:
-        _train_in_subprocess(agent, max_examples, technique=technique, force_include_paths=force_include_paths)
-        return True
-    except subprocess.CalledProcessError as exc:
-        print(f"\n  !! {agent.upper()} team training crashed (exit code {exc.returncode}) - "
-              f"skipping this round's training and continuing. If this keeps happening, check "
-              f"whether another GPU-heavy process is running at the same time.")
-        return False
+    crash. Retries a fixed number of times with a short delay first, since
+    this kind of crash has been observed to be a transient parent/child GPU
+    handoff issue rather than a deterministic one. Returns whether training
+    actually completed."""
+    attempt = 0
+    while True:
+        try:
+            _train_in_subprocess(agent, max_examples, technique=technique, force_include_paths=force_include_paths)
+            return True
+        except subprocess.CalledProcessError as exc:
+            attempt += 1
+            if attempt > _TRAIN_CRASH_RETRIES:
+                print(f"\n  !! {agent.upper()} team training crashed (exit code {exc.returncode}) after "
+                      f"{attempt} attempt(s) - skipping this round's training and continuing. If this keeps "
+                      f"happening, check whether another GPU-heavy process is running at the same time, or "
+                      f"whether a recent NVIDIA driver update introduced a regression - exit code 3221225477 "
+                      f"is STATUS_ACCESS_VIOLATION, a native CUDA crash below the level Python can catch.")
+                return False
+            print(f"\n  !! {agent.upper()} team training crashed (exit code {exc.returncode}) - retrying in "
+                  f"{_TRAIN_CRASH_RETRY_DELAY_SECONDS}s (attempt {attempt}/{_TRAIN_CRASH_RETRIES})...")
+            time.sleep(_TRAIN_CRASH_RETRY_DELAY_SECONDS)
 
 
 def run_loop(
@@ -161,20 +197,31 @@ def run_loop(
     max_examples_to_train: int = 200,
     target_url: str | None = None,
     technique: str = DEFAULT_TECHNIQUE_ID,
+    use_curriculum: bool = True,
+    use_league: bool = False,
+    run_id: str | None = None,
 ) -> None:
     """target_url: leave as None (default) for Step 5 target diversity - a
     fresh target is picked from training.targets.pick_training_target()
     every battle, randomized across that technique's training-pool targets
     plus an occasional distractor. Pass an explicit URL (--target-url) to
     pin every battle to one fixed target instead, e.g. for debugging a
-    single lab app."""
+    single lab app.
+
+    use_curriculum (Step 9.1): when True and no target is pinned, pick targets
+    by curriculum (easy tiers first, harder ones unlock as the win rate
+    stabilizes) instead of uniform random. use_league (Step 9.3): when True,
+    some rounds pit the current side against an archived past opponent to
+    resist self-play collapse."""
     tech = get_technique(technique)  # fail fast on a typo'd --technique
+    run_id = run_id or _run_stamp()
 
     # Refuses to start if another process is already battling this
     # technique, instead of silently corrupting shared round-numbering and
     # target state (see training/process_lock.py for why this happened).
     with technique_lock(technique):
-        _run_loop_locked(tech, rounds, battles_per_round, min_examples_to_train, max_examples_to_train, target_url, technique)
+        _run_loop_locked(tech, rounds, battles_per_round, min_examples_to_train, max_examples_to_train,
+                         target_url, technique, use_curriculum, use_league, run_id)
 
 
 def _reachable_targets(technique_id: str, target_url: str | None) -> tuple[bool, list[str]]:
@@ -224,7 +271,10 @@ def _zero_session_stat(tech, status: str) -> dict:
     return {
         "id": tech.id, "display_name": tech.display_name, "status": status, "elapsed_seconds": 0.0,
         "attack_battles": 0, "attack_successes": 0, "detections": 0, "normal_battles": 0, "false_positives": 0,
+        "fix_proposed": 0, "fix_verified": 0,
+        "real_attack_battles": 0, "real_attack_successes": 0,
         "red_attack_success_rate": None, "blue_detection_rate": None, "blue_false_positive_rate": None,
+        "blue_fix_verified_rate": None,
     }
 
 
@@ -240,6 +290,10 @@ def _session_stat_from_progress(tech, status: str, elapsed_seconds: float, basel
     detections = after["total_detections"] - baseline["total_detections"]
     normal_battles = after["total_normal_battles"] - baseline["total_normal_battles"]
     false_positives = after["total_false_positives"] - baseline["total_false_positives"]
+    fix_proposed = after["total_fix_proposed"] - baseline["total_fix_proposed"]
+    fix_verified = after["total_fix_verified"] - baseline["total_fix_verified"]
+    real_attack_battles = after["total_real_attack_battles"] - baseline["total_real_attack_battles"]
+    real_attack_successes = after["total_real_attack_successes"] - baseline["total_real_attack_successes"]
     return {
         "id": tech.id,
         "display_name": tech.display_name,
@@ -250,9 +304,17 @@ def _session_stat_from_progress(tech, status: str, elapsed_seconds: float, basel
         "detections": detections,
         "normal_battles": normal_battles,
         "false_positives": false_positives,
-        "red_attack_success_rate": attack_successes / attack_battles if attack_battles else None,
+        "fix_proposed": fix_proposed,
+        "fix_verified": fix_verified,
+        "real_attack_battles": real_attack_battles,
+        "real_attack_successes": real_attack_successes,
+        # Step 5.3 - computed from real_* (excludes distractor-target
+        # battles, which are deliberately unexploitable) so this doesn't
+        # structurally cap out below 100% regardless of red's actual skill.
+        "red_attack_success_rate": real_attack_successes / real_attack_battles if real_attack_battles else None,
         "blue_detection_rate": detections / attack_battles if attack_battles else None,
         "blue_false_positive_rate": false_positives / normal_battles if normal_battles else None,
+        "blue_fix_verified_rate": fix_verified / fix_proposed if fix_proposed else None,
     }
 
 
@@ -288,6 +350,8 @@ def run_loop_all(
     run_eval_snapshots: bool = True,
     eval_attacks_per_technique: int = 2,
     eval_normal_per_technique: int = 1,
+    use_curriculum: bool = True,
+    use_league: bool = False,
 ) -> None:
     """--technique all: runs every registered technique's full rounds x
     battles back-to-back in one process, instead of one `python -m
@@ -308,9 +372,22 @@ def run_loop_all(
     stay meaningful next to any manual eval_harness runs in the same
     eval_summary.jsonl / TensorBoard history, instead of colliding with
     round 0 or injecting a raw timestamp into that series."""
-    techniques = list_techniques()
+    # Chain steps (token_leak, account_takeover) can't win standalone - they
+    # need an artifact the previous step hands them via the router chain - so
+    # the self-play sweep skips them (they'd only log 0% noise and no training
+    # wins). They're still exercised in sequence by the router battle-runner.
+    skipped_chain = [t.id for t in list_techniques() if getattr(t, "chain_step", False)]
+    techniques = [t for t in list_techniques() if not getattr(t, "chain_step", False)]
     total = len(techniques)
     overall_start = time.time()
+    if skipped_chain:
+        print(f"  (skipping chain-step techniques {skipped_chain} - trained via the router chain path, "
+              f"not the standalone sweep)")
+    # One shared stamp for the whole session, so every technique's live/round
+    # writers land under the same run leaf (e.g. live/idor/<stamp>,
+    # live/ssrf/<stamp>) and TensorBoard groups the session as one selectable
+    # run across techniques instead of scattering it.
+    run_id = _run_stamp()
 
     print("#" * 60)
     print(f"  SENTINEL AI — ALL-TECHNIQUES OVERNIGHT RUN ({total} techniques)")
@@ -356,6 +433,9 @@ def run_loop_all(
                 max_examples_to_train=max_examples_to_train,
                 target_url=target_url,
                 technique=tech.id,
+                use_curriculum=use_curriculum,
+                use_league=use_league,
+                run_id=run_id,
             )
         except RuntimeError as exc:
             # technique_lock: another process already holds this technique.
@@ -411,7 +491,11 @@ def _run_loop_locked(
     max_examples_to_train: int,
     target_url: str | None,
     technique: str,
+    use_curriculum: bool = True,
+    use_league: bool = False,
+    run_id: str | None = None,
 ) -> None:
+    run_id = run_id or _run_stamp()
     print("=" * 60)
     print("  SENTINEL AI — SELF-PLAY TRAINING LOOP")
     print("=" * 60)
@@ -421,12 +505,17 @@ def _run_loop_locked(
     print(f"  Max to train:    {max_examples_to_train} (sliding window)")
     if target_url:
         print(f"  Target:          {tech.display_name} vs {target_url} (fixed, --target-url override)")
+    elif use_curriculum:
+        print(f"  Target:          {tech.display_name} vs curriculum-selected targets (Step 9.1, tier "
+              f"{curriculum.unlocked_tier(technique)} unlocked)")
     else:
         print(f"  Target:          {tech.display_name} vs randomized training-pool targets (Step 5)")
+    print(f"  Curriculum:      {'on' if (use_curriculum and not target_url) else 'off'}   "
+          f"League: {'on' if use_league else 'off (snapshots still archived)'}")
     print("=" * 60)
 
-    live_writer = _open_writer(TENSORBOARD_LIVE_DIR / technique)
-    round_writer = _open_writer(TENSORBOARD_TRAIN_DIR / technique)
+    live_writer = _open_writer(TENSORBOARD_LIVE_DIR / technique / run_id)
+    round_writer = _open_writer(TENSORBOARD_TRAIN_DIR / technique / run_id)
 
     # Cumulative counts and the round number itself are both persisted to
     # disk (training/progress_state.py) and loaded here rather than starting
@@ -442,6 +531,12 @@ def _run_loop_locked(
     total_detections = progress["total_detections"]
     total_normal_battles = progress["total_normal_battles"]
     total_false_positives = progress["total_false_positives"]
+    total_fix_proposed = progress["total_fix_proposed"]
+    total_fix_verified = progress["total_fix_verified"]
+    total_real_attack_battles = progress["total_real_attack_battles"]
+    total_real_attack_successes = progress["total_real_attack_successes"]
+    total_red_reward = progress["total_red_reward"]
+    total_blue_reward = progress["total_blue_reward"]
 
     try:
         for round_num in range(1, rounds + 1):
@@ -464,6 +559,17 @@ def _run_loop_locked(
             detections = 0
             normal_battles = 0
             false_positives = 0
+            fix_proposed = 0
+            fix_verified = 0
+            # real_* excludes distractor-target attack battles (Step 5.3) -
+            # those are deliberately unexploitable, so counting them toward
+            # red's success rate structurally caps it below 100% regardless
+            # of red's actual skill. This is what red_attack_success_rate is
+            # computed from everywhere below; attack_battles/attack_successes
+            # above still count every attack round (including distractor),
+            # since that's the correct denominator for blue's detection rate.
+            real_attack_battles = 0
+            real_attack_successes = 0
             round_start = time.time()
 
             # Paths of blue_wins saved THIS round - passed to
@@ -478,6 +584,33 @@ def _run_loop_locked(
             red_version = get_version(adapter_path("red", technique))
             blue_version = get_version(adapter_path("blue"))
 
+            # Step 9.2 - per-round partial-reward sums (graded 0.0-1.0).
+            round_red_reward = 0.0
+            round_blue_reward = 0.0
+
+            # Step 9.3 - league matchmaking for this round. Clear any prior
+            # override first, then maybe replace ONE side with an archived past
+            # opponent so the current side trains against an old adversary, not
+            # only itself. Safe on VRAM: inference models are unloaded at every
+            # round boundary (before training), so only one adapter per side is
+            # ever resident within a round.
+            os.environ.pop("RED_ADAPTER_PATH_OVERRIDE", None)
+            os.environ.pop("BLUE_ADAPTER_PATH", None)
+            league_desc = "current vs current"
+            if use_league and not target_url:
+                import random as _rng
+                if _rng.random() < 0.5:
+                    past_red = league.pick_opponent_version(red_version, league.available_versions("red", technique), p_past=1.0)
+                    if past_red is not None:
+                        os.environ["RED_ADAPTER_PATH_OVERRIDE"] = str(league.opponent_adapter_path("red", technique, past_red))
+                        league_desc = f"blue v{blue_version} (current) vs red v{past_red} (past)"
+                else:
+                    past_blue = league.pick_opponent_version(blue_version, league.available_versions("blue", None), p_past=1.0)
+                    if past_blue is not None:
+                        os.environ["BLUE_ADAPTER_PATH"] = str(league.opponent_adapter_path("blue", None, past_blue))
+                        league_desc = f"red v{red_version} (current) vs blue v{past_blue} (past)"
+                print(f"  League matchup: {league_desc}")
+
             for battle_num in range(1, battles_per_round + 1):
                 # Step 5.2: a fresh target is picked every battle (not once
                 # per round) so red/blue never settle into memorizing one
@@ -486,6 +619,10 @@ def _run_loop_locked(
                 if target_url:
                     battle_target_url = target_url
                     picked_target = None
+                elif use_curriculum:
+                    # Step 9.1 - draw from the tiers unlocked so far, easiest first.
+                    picked_target = curriculum.pick_curriculum_target(technique)
+                    battle_target_url = picked_target.url
                 else:
                     picked_target = pick_training_target(technique)
                     battle_target_url = picked_target.url
@@ -494,10 +631,13 @@ def _run_loop_locked(
 
                 result = run_simulation(target_url=battle_target_url, technique=technique)
 
-                attack  = result["attack"]
-                defense = result["defense"]
-                verdict = result["evaluation"]
-                was_attack = attack.get("was_attack", True)
+                attack      = result["attack"]
+                defense     = result["defense"]
+                verdict     = result["evaluation"]
+                remediation = result.get("remediation", {})
+                was_attack  = attack.get("was_attack", True)
+
+                is_distractor = picked_target is not None and picked_target.role == "distractor"
 
                 if was_attack:
                     attack_battles += 1
@@ -508,12 +648,44 @@ def _run_loop_locked(
                     if verdict.get("detection_correct"):
                         detections += 1
                         total_detections += 1
+                    if not is_distractor:
+                        real_attack_battles += 1
+                        total_real_attack_battles += 1
+                        if verdict.get("attack_success"):
+                            real_attack_successes += 1
+                            total_real_attack_successes += 1
                 else:
                     normal_battles += 1
                     total_normal_battles += 1
                     if verdict.get("false_positives"):
                         false_positives += 1
                         total_false_positives += 1
+
+                # Step 9.2 - accumulate graded partial-credit rewards alongside
+                # the binary counters above.
+                round_red_reward += verdict.get("red_reward", 0.0)
+                total_red_reward += verdict.get("red_reward", 0.0)
+                round_blue_reward += verdict.get("blue_reward", 0.0)
+                total_blue_reward += verdict.get("blue_reward", 0.0)
+
+                # Step 9.1 - feed real attack outcomes to the curriculum, which
+                # unlocks harder target tiers once this one is reliably beaten.
+                # Distractor rounds aren't real attacks; normal-traffic rounds
+                # aren't attacks at all - neither counts toward promotion.
+                if use_curriculum and not target_url and was_attack and not is_distractor:
+                    curriculum.record_outcome(technique, bool(verdict.get("attack_success")))
+
+                # Step 7.3: fix verification is a second, independent signal
+                # from detection accuracy - it only ever fires on a battle
+                # where verify_fix() actually attempted a replay (see
+                # agents/judge/verification.py), which requires a real
+                # successful attack and a non-empty recommended_fix.
+                if remediation.get("attempted"):
+                    fix_proposed += 1
+                    total_fix_proposed += 1
+                    if remediation.get("fix_verified"):
+                        fix_verified += 1
+                        total_fix_verified += 1
 
                 # Step 4.2: log every battle (not just wins) with its full
                 # transcript, reward, and the adapter version each side played
@@ -535,6 +707,7 @@ def _run_loop_locked(
                     target_id=picked_target.id if picked_target else None,
                     target_role=picked_target.role if picked_target else None,
                     target_framework=picked_target.framework if picked_target else None,
+                    remediation=remediation,
                 )
 
                 # Persist the running totals after every battle (not just
@@ -548,6 +721,12 @@ def _run_loop_locked(
                     "total_detections": total_detections,
                     "total_normal_battles": total_normal_battles,
                     "total_false_positives": total_false_positives,
+                    "total_fix_proposed": total_fix_proposed,
+                    "total_fix_verified": total_fix_verified,
+                    "total_real_attack_battles": total_real_attack_battles,
+                    "total_real_attack_successes": total_real_attack_successes,
+                    "total_red_reward": total_red_reward,
+                    "total_blue_reward": total_blue_reward,
                 })
 
                 # Step 4.3 (live): one point per battle, on a running
@@ -555,11 +734,19 @@ def _run_loop_locked(
                 # curve is visible while a round is still in progress
                 # instead of only appearing once the round completes.
                 if live_writer is not None:
-                    if total_attack_battles:
+                    # Per-technique live (intra-run) curves. The technique is
+                    # kept in the tag ("live/<technique>/...") so each
+                    # technique gets its OWN chart in TensorBoard instead of
+                    # every technique's line piling onto one shared chart. Red
+                    # attack success and blue detection both appear here (the
+                    # live view); their round-summary counterparts are in the
+                    # rounds writer (the rounds view).
+                    if total_real_attack_battles:
                         live_writer.add_scalar(
                             f"live/{technique}/cumulative_red_attack_success_rate",
-                            total_attack_successes / total_attack_battles, total_attack_battles,
+                            total_real_attack_successes / total_real_attack_battles, total_real_attack_battles,
                         )
+                    if total_attack_battles:
                         live_writer.add_scalar(
                             f"live/{technique}/cumulative_blue_detection_rate",
                             total_detections / total_attack_battles, total_attack_battles,
@@ -568,6 +755,11 @@ def _run_loop_locked(
                         live_writer.add_scalar(
                             f"live/{technique}/cumulative_false_positive_rate",
                             total_false_positives / total_normal_battles, total_normal_battles,
+                        )
+                    if total_fix_proposed:
+                        live_writer.add_scalar(
+                            f"live/{technique}/cumulative_fix_verified_rate",
+                            total_fix_verified / total_fix_proposed, total_fix_proposed,
                         )
                     live_writer.add_scalar(
                         f"live/{technique}/battle_quality",
@@ -594,20 +786,64 @@ def _run_loop_locked(
                 if verdict.get("detection_correct"):
                     log_excerpt = defense.pop("_log_excerpt", "")
                     blue_user_prompt = BLUE_LIVE_USER_PROMPT_TEMPLATE.format(log_text=log_excerpt or "(no new log lines)")
-                    saved_path = save_blue_win(attack, defense, BLUE_SYSTEM, blue_user_prompt, example_technique)
+
+                    # Detection and remediation are separate skills, so they
+                    # get separate gates. Detection correctness (the outer if)
+                    # is what makes this a blue win and is ALWAYS trained on.
+                    # The recommended_fix rides along in the same defense
+                    # payload, but blue should never learn to reproduce an
+                    # unverified or wrong fix just because the detection was
+                    # right (that's how blacklist-style SQLi fixes leaked into
+                    # the pool). So the fix fields are kept only when the fix
+                    # actually verified - replayed against the patched target
+                    # and confirmed to close the hole - and stripped
+                    # otherwise, leaving a detection-only training example.
+                    # Step 7.3: a verified fix is additionally saved a SECOND
+                    # time (oversampling via training/dataset.py's
+                    # always_include), so good fixes are over-represented in
+                    # blue's batch rather than merely allowed in.
+                    fix_verified = bool(remediation.get("fix_verified"))
+                    defense_for_training = dict(defense)
+                    if not fix_verified:
+                        for _k in ("recommended_fix", "mitigation", "recommendations"):
+                            defense_for_training.pop(_k, None)
+
+                    saved_path = save_blue_win(attack, defense_for_training, BLUE_SYSTEM, blue_user_prompt, example_technique)
                     this_round_blue_win_paths.append(saved_path)
+                    if fix_verified:
+                        extra_path = save_blue_win(attack, defense_for_training, BLUE_SYSTEM, blue_user_prompt, example_technique)
+                        this_round_blue_win_paths.append(extra_path)
 
                 quality = verdict.get("defense_quality", 0)
                 mode = "attack" if was_attack else "normal"
                 print(f"mode={mode:<6}  attack_success={str(verdict.get('attack_success')):<5}  "
                       f"detected={str(verdict.get('detection_correct')):<5}  quality={quality:.1f}  "
-                      f"(AS:{attack_successes}/{attack_battles} DET:{detections}/{attack_battles} FP:{false_positives}/{normal_battles})")
+                      f"fix_verified={remediation.get('fix_verified')}  "
+                      f"(AS:{real_attack_successes}/{real_attack_battles} DET:{detections}/{attack_battles} "
+                      f"FP:{false_positives}/{normal_battles} FIXV:{fix_verified}/{fix_proposed})")
 
             round_time = round(time.time() - round_start, 1)
             print(f"\n  Round {round_num} complete in {round_time}s")
-            print(f"  Red attack success {attack_successes}/{attack_battles}  |  "
+            print(f"  Red attack success {real_attack_successes}/{real_attack_battles} "
+                  f"(excl. {attack_battles - real_attack_battles} distractor rounds)  |  "
                   f"Blue detection {detections}/{attack_battles}  |  "
-                  f"False positives {false_positives}/{normal_battles}")
+                  f"False positives {false_positives}/{normal_battles}  |  "
+                  f"Fix verified {fix_verified}/{fix_proposed}")
+
+            # Step 9.2 - graded reward means this round (a "how close" signal
+            # the binary rates above can't show). Step 9.4 - record the cost of
+            # this round's battles.
+            battles_done = attack_battles + normal_battles
+            mean_red_reward = round_red_reward / attack_battles if attack_battles else 0.0
+            mean_blue_reward = round_blue_reward / battles_done if battles_done else 0.0
+            tier_note = f"  |  curriculum tier {curriculum.unlocked_tier(technique)}" if (use_curriculum and not target_url) else ""
+            print(f"  Partial reward: red {mean_red_reward:.2f}/attack  |  blue {mean_blue_reward:.2f}/battle{tier_note}")
+            cost_tracker.record("round_battles", technique, round_time, battles=battles_done,
+                                red_reward=round(round_red_reward, 3), blue_reward=round(round_blue_reward, 3))
+            if round_writer is not None:
+                round_writer.add_scalar(f"round/{technique}/mean_red_reward", mean_red_reward, global_round)
+                round_writer.add_scalar(f"round/{technique}/mean_blue_reward", mean_blue_reward, global_round)
+                round_writer.flush()
 
             # Log stats for tracking improvement over time. Keyed on
             # global_round (persisted, never resets) rather than the local
@@ -615,9 +851,9 @@ def _run_loop_locked(
             # a round number - that collision used to make this file (and
             # the matching TensorBoard chart) look like nonsense once you'd
             # restarted training more than once.
-            _log_stats(global_round, technique, attack_battles, attack_successes, detections, normal_battles, false_positives, round_time)
+            _log_stats(global_round, technique, attack_battles, attack_successes, detections, normal_battles, false_positives, fix_proposed, fix_verified, round_time, real_attack_battles, real_attack_successes)
             if round_writer is not None:
-                _log_tensorboard_round(round_writer, technique, global_round, attack_battles, attack_successes, detections, normal_battles, false_positives)
+                _log_tensorboard_round(round_writer, technique, global_round, attack_battles, attack_successes, detections, normal_battles, false_positives, fix_proposed, fix_verified, real_attack_battles, real_attack_successes)
 
             # Unload inference models and Ollama judge before training to free VRAM
             _unload_inference_models()
@@ -633,7 +869,13 @@ def _run_loop_locked(
                 red_paths = get_data_path("red", technique, max_examples=max_examples_to_train)
                 print(f"\n  Training RED team on {len(red_paths)} most recent "
                       f"{tech.display_name} wins (of {n_red} total)...")
-                _train_safely("red", max_examples_to_train, technique=technique)
+                with cost_tracker.track("red_train", technique, examples=len(red_paths)):
+                    red_trained = _train_safely("red", max_examples_to_train, technique=technique)
+                # Step 9.3 - archive the just-trained checkpoint into the league.
+                if red_trained:
+                    new_red_v = get_version(adapter_path("red", technique))
+                    if league.snapshot("red", technique, new_red_v):
+                        print(f"  League: archived red {technique} v{new_red_v}")
             else:
                 print(f"\n  RED team: only {n_red} {tech.display_name} wins so far "
                       f"(need {min_examples_to_train} to train, skipping)")
@@ -651,11 +893,20 @@ def _run_loop_locked(
                 breakdown_str = ", ".join(f"{t}={c}" for t, c in breakdown.items())
                 print(f"\n  Training BLUE team (shared) on {len(blue_paths)} most recent wins "
                       f"across all techniques (of {n_blue} total, capped per technique): {breakdown_str}")
-                _train_safely("blue", max_examples_to_train, force_include_paths=this_round_blue_win_paths)
+                with cost_tracker.track("blue_train", technique, examples=len(blue_paths)):
+                    blue_trained = _train_safely("blue", max_examples_to_train, force_include_paths=this_round_blue_win_paths)
+                # Step 9.3 - archive the just-trained shared blue checkpoint.
+                if blue_trained:
+                    new_blue_v = get_version(adapter_path("blue"))
+                    if league.snapshot("blue", None, new_blue_v):
+                        print(f"  League: archived blue v{new_blue_v}")
             else:
                 print(f"\n  BLUE team: only {n_blue} wins across all techniques so far "
                       f"(need {min_examples_to_train} to train, skipping)")
     finally:
+        # Step 9.3 - never leave a league adapter override set past the loop.
+        os.environ.pop("RED_ADAPTER_PATH_OVERRIDE", None)
+        os.environ.pop("BLUE_ADAPTER_PATH", None)
         if live_writer is not None:
             live_writer.close()
         if round_writer is not None:
@@ -712,43 +963,58 @@ def _unload_inference_models() -> None:
     _mem_checkpoint("battle_loop: after unloading inference models")
 
 
-def _log_stats(round_num, technique, attack_battles, attack_successes, detections, normal_battles, false_positives, elapsed):
+def _log_stats(round_num, technique, attack_battles, attack_successes, detections, normal_battles, false_positives, fix_proposed, fix_verified, elapsed, real_attack_battles, real_attack_successes):
     STATS_FILE.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "round": round_num,
         "technique": technique,
         "attack_battles": attack_battles,
         "attack_successes": attack_successes,
+        # Step 5.3 - excludes distractor-target rounds, which are
+        # deliberately unexploitable; see agents/safety plan notes /
+        # training/progress_state.py for why this differs from
+        # attack_battles/attack_successes above (still the right
+        # denominator for blue_detection_rate).
+        "real_attack_battles": real_attack_battles,
+        "real_attack_successes": real_attack_successes,
         "detections": detections,
         "normal_battles": normal_battles,
         "false_positives": false_positives,
-        "red_attack_success_rate": round(attack_successes / attack_battles, 3) if attack_battles else 0,
+        "fix_proposed": fix_proposed,
+        "fix_verified": fix_verified,
+        "red_attack_success_rate": round(real_attack_successes / real_attack_battles, 3) if real_attack_battles else 0,
         "blue_detection_rate": round(detections / attack_battles, 3) if attack_battles else 0,
         "blue_false_positive_rate": round(false_positives / normal_battles, 3) if normal_battles else 0,
+        "blue_fix_verified_rate": round(fix_verified / fix_proposed, 3) if fix_proposed else 0,
         "elapsed_seconds": elapsed,
     }
     with open(STATS_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
 
-def _log_tensorboard_round(writer, technique, global_round, attack_battles, attack_successes, detections, normal_battles, false_positives) -> None:
+def _log_tensorboard_round(writer, technique, global_round, attack_battles, attack_successes, detections, normal_battles, false_positives, fix_proposed, fix_verified, real_attack_battles, real_attack_successes) -> None:
     """Step 4.3: round-level scalars - red's attack success rate and blue's
     detection rate tracked independently (not collapsed into a win/loss/
     draw), plus blue's false-positive rate on normal-traffic rounds - so
     training-time progress is plottable next to eval_harness.py's held-out
     numbers (which use this same framing) in the same TensorBoard instance.
+    Step 7.3 adds fix_verified_rate alongside them - blue's remediation
+    signal, tracked independently from detection the same way false positives
+    already are.
 
-    Takes an already-open writer (opened once per run_loop() call) rather
-    than opening its own per round - both to stop fragmenting the log
-    directory into one tiny event file per round, and because global_round
-    is now a persisted, ever-increasing number (training/progress_state.py),
-    so points from different process runs extend the same line instead of
-    overlapping it."""
+    Takes an already-open writer (opened once per run_loop() call, into this
+    run's own dated directory so sessions don't overlap). The technique is
+    kept in each tag ("rounds/<technique>/...") so every technique gets its
+    OWN chart - red's attack success rate and blue's detection rate both in
+    the rounds view, mirroring the live writer's per-technique live view."""
+    if real_attack_battles:
+        writer.add_scalar(f"rounds/{technique}/red_attack_success_rate", real_attack_successes / real_attack_battles, global_round)
     if attack_battles:
-        writer.add_scalar(f"rounds/{technique}/red_attack_success_rate", attack_successes / attack_battles, global_round)
         writer.add_scalar(f"rounds/{technique}/blue_detection_rate", detections / attack_battles, global_round)
     if normal_battles:
         writer.add_scalar(f"rounds/{technique}/false_positive_rate", false_positives / normal_battles, global_round)
+    if fix_proposed:
+        writer.add_scalar(f"rounds/{technique}/fix_verified_rate", fix_verified / fix_proposed, global_round)
     writer.flush()
 
 
@@ -775,6 +1041,14 @@ if __name__ == "__main__":
     parser.add_argument("--eval-normal-per-technique", type=int, default=1,
                         help="--technique all only: normal-traffic battles per target in each before/after "
                              "eval snapshot. Default: 1.")
+    parser.add_argument("--no-curriculum", action="store_true",
+                        help="Step 9.1: disable curriculum target selection (easy tiers first, harder ones "
+                             "unlock as the win rate stabilizes) and go back to uniform random target picks. "
+                             "Ignored when --target-url pins a single target.")
+    parser.add_argument("--league", action="store_true",
+                        help="Step 9.3: enable the checkpoint league - some rounds pit the current side "
+                             "against an archived past opponent to resist self-play collapse. Off by default "
+                             "(it loads an extra adapter). Checkpoint snapshotting happens regardless.")
     args = parser.parse_args()
 
     if args.technique == "all":
@@ -790,6 +1064,8 @@ if __name__ == "__main__":
             run_eval_snapshots=not args.no_eval,
             eval_attacks_per_technique=args.eval_attacks_per_technique,
             eval_normal_per_technique=args.eval_normal_per_technique,
+            use_curriculum=not args.no_curriculum,
+            use_league=args.league,
         )
     else:
         run_loop(
@@ -799,4 +1075,6 @@ if __name__ == "__main__":
             max_examples_to_train=args.max_examples,
             target_url=args.target_url,
             technique=args.technique,
+            use_curriculum=not args.no_curriculum,
+            use_league=args.league,
         )

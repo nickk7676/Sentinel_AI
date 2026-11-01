@@ -102,4 +102,16 @@ COMMAND_INJECTION = register(Technique(
     describe_attempt=_describe_attempt,
     perform_normal_action=_perform_normal_diagnostics,
     category_keywords=("command injection", "os command", "shell injection", "rce", "remote code execution"),
+    # Excludes bare "sanitiz"/"input validation" - generic boilerplate that
+    # never actually confirms the shell was removed from the picture, which
+    # is the real fix. Broadened 2026-07-26 after real battle logs showed
+    # blue producing varied, genuinely mechanism-specific answers (shlex.
+    # split()+subprocess.run(shell=False), command whitelists, argument-list
+    # splitting) that the original narrower phrases ("argument list instead
+    # of a string", "allowlist of permitted commands") didn't recognize -
+    # this was a keyword-matching gap, not a model-quality problem. "allowlist"/
+    # "whitelist" bare are fine here (unlike for ssrf/path_traversal) since
+    # this list is only ever checked against a real command_injection battle,
+    # not compared across techniques.
+    fix_keywords=("shell=false", "shlex.split", "avoid invoking a shell", "no shell interpolation", "without shell execution", "disallows shell", "argument list", "list of arguments", "allowlist", "whitelist", "avoid os.system", "escape shell metacharacters", "strip shell metacharacters", "stripping metacharacters", "validating the allowed command"),
 ))
